@@ -267,7 +267,7 @@ sondern weil die Community es getan hat. DirectShell-Profile sind die Cmdlets de
 einer spezifischen App interpretiert. Genau wie PowerShell Cmdlets braucht.**
 
 ### Phase 3 (Input Middleware)
-- **HEDS Integration** — PII-Sanitization auf JEDER App, nicht nur Browser
+- **PII Sanitization** — Input filtering on ANY app, not just browsers
   - User tippt in Claude Desktop → DirectShell faengt ab → sanitized → sendet weiter
   - Loest das "Desktop Apps sind geschlossene Clients" Problem KOMPLETT
 - **Input Logging** — was wurde getippt? (Accessibility, Audit)
@@ -386,7 +386,7 @@ DirectShell → MCP → LLM → beliebiges Programm des Planeten
 - Voice Control in eine App bauen die es nicht hat
 - Auto-Translate in einen Chat der es verbietet
 - Copy-Paste in Feldern erzwingen die es blockieren
-- HEDS PII-Sanitization auf JEDER App — nicht nur Browser
+- PII Sanitization on ANY app — not just browsers
 - Jede Legacy-Software LLM-steuerbar machen — ohne eine Zeile am Original zu aendern
 
 ### Die Machtverschiebung
@@ -402,7 +402,7 @@ Vendor Lock-in entmachtet. Jede Software wird zur Marionette des Users.
 DirectShell loest Martins wiederkehrendes Problem:
 > "Wie komme ich zwischen User-Input und eine geschlossene Desktop-App?"
 
-- HEDS brauchte Browser Extension als Kompromiss → DirectShell macht es nativ fuer JEDE App
+- Browser extensions were always a compromise → DirectShell does it natively for ANY app
 - A.D.A. koennte DirectShell als Overlay nutzen → visuelles Feedback direkt auf der App
 - Universell einsetzbar → groesste Zielgruppe aller Projekte
 - **DirectShell ist das Fundament fuer ALLE anderen Projekte** — der universelle Connector

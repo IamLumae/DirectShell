@@ -4,8 +4,11 @@
 
 <p align="center"><strong>Universal Application Control Through the Accessibility Layer</strong></p>
 
+<p align="center"><em><strong>As of February 17, 2026, every screenshot-based AI agent, every enterprise API wrapper, and every RPA tool on Earth is legacy technology.</strong></em></p>
+
 <p align="center">
   <a href="https://youtu.be/nvZobyt0KBg">Watch the Demo</a> &middot;
+  <a href="LLM_GUIDE.md">LLM Quick Start Guide</a> &middot;
   <a href="Dokumentation/DEVTO_ARTICLE.pdf">Read the Full Article</a> &middot;
   <a href="Dokumentation/2026-02-16_Genesis_Session.txt">Read the Genesis Session</a>
 </p>

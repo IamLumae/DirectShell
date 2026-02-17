@@ -291,7 +291,7 @@ PowerShell automates the backend. **DirectShell automates the frontend.**
 | Use Case | Description |
 |----------|-------------|
 | **Universal AI Agent Connector** | Any LLM controls any GUI via text. No screenshots, no vision model. |
-| **PII Sanitization (HEDS)** | Intercept text input to any app. Sanitize personal data before it reaches LLM chat interfaces. Works on desktop apps, not just browsers. |
+| **PII Sanitization** | Intercept text input to any app. Sanitize personal data before it reaches LLM chat interfaces. Works on desktop apps, not just browsers. |
 | **Input Logging / Audit** | Record what was typed into which application, when. Accessibility and compliance. |
 
 ### 5.2 Near-Term
