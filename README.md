@@ -185,19 +185,22 @@ cargo build --release
 ./target/release/directshell.exe
 ```
 
-A small transparent window appears. Drag it over any application to snap. The Accessibility Tree is now being written to the database at 2 Hz.
+A small transparent window appears. Drag it over any application to snap. The Accessibility Tree is now being written to a database inside the `ds_profiles/` directory at 2 Hz. Each snapped application gets its own database file (e.g. `ds_profiles/notepad.db`).
 
 ### Query
 
 ```bash
-sqlite3 directshell.db "SELECT name, role, value FROM elements WHERE role='Edit'"
+# Replace "notepad" with the name of the app you snapped to
+sqlite3 ds_profiles/notepad.db "SELECT name, role, value FROM elements WHERE role='Edit'"
 ```
 
 ### Inject
 
 ```bash
-sqlite3 directshell.db "INSERT INTO inject (action, text, target) VALUES ('text', 'Hello', 'Search Box')"
+sqlite3 ds_profiles/notepad.db "INSERT INTO inject (action, text, target) VALUES ('text', 'Hello', 'Search Box')"
 ```
+
+> **Note:** `ds_profiles/` is created relative to where you run `directshell.exe`. If you run it from the repo root, the databases will be at `./ds_profiles/`.
 
 ---
 
@@ -226,12 +229,14 @@ The MCP server exposes DirectShell's capabilities as structured tool calls that 
   "mcpServers": {
     "directshell": {
       "command": "python",
-      "args": ["ds-mcp/server.py"],
+      "args": ["ds-mcp/server.py", "--profiles", "/path/to/DirectShell/ds_profiles"],
       "cwd": "/path/to/DirectShell"
     }
   }
 }
 ```
+
+> **Important:** The `--profiles` path must point to the same `ds_profiles/` directory where `directshell.exe` writes its databases. If you run the EXE from the repo root, that's `./ds_profiles/`.
 
 With this, any LLM using MCP can read and control any Windows application through natural language.
 
