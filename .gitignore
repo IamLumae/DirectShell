@@ -1,0 +1,13 @@
+/target
+ds-mcp/__pycache__/
+*.pyc
+Dokumentation/2026-02-16_Genesis_Session.txt
+Dokumentation/Deep Research.txt
+Dokumentation/DEVTO_ARTICLE.md
+Dokumentation/DEVTO_SHORT.md
+Dokumentation/*.pdf
+Dokumentation/md2pdf.py
+ds_profiles/
+*.db
+*.a11y
+*.snap
