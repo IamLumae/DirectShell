@@ -1,6 +1,14 @@
-# DirectShell
+<p align="center">
+  <img src="assets/banner.png" alt="DirectShell" width="600">
+</p>
 
-**Universal Application Control Through the Accessibility Layer**
+<p align="center"><strong>Universal Application Control Through the Accessibility Layer</strong></p>
+
+<p align="center">
+  <a href="https://youtu.be/nvZobyt0KBg">Watch the Demo</a> &middot;
+  <a href="Dokumentation/DEVTO_ARTICLE.pdf">Read the Full Article</a> &middot;
+  <a href="Dokumentation/2026-02-16_Genesis_Session.txt">Read the Genesis Session</a>
+</p>
 
 ---
 
@@ -90,6 +98,8 @@ That's like every room in a house needing its own lock with its own key — and 
 ---
 
 ## Demo
+
+[![DirectShell Demo](https://img.youtube.com/vi/nvZobyt0KBg/maxresdefault.jpg)](https://youtu.be/nvZobyt0KBg)
 
 On February 17, 2026, DirectShell demonstrated three paradigms in 5 minutes:
 
@@ -280,6 +290,8 @@ DirectShell does not bypass access controls. It does not inject code into other 
 - [`BRAINSTORM.md`](BRAINSTORM.md) — Original vision and design decisions
 - [`Dokumentation/ARCHITECTURE.md`](Dokumentation/ARCHITECTURE.md) — Technical reference (code-level)
 - [`Dokumentation/PAPER.md`](Dokumentation/PAPER.md) — Academic whitepaper
+- [`Dokumentation/DEVTO_ARTICLE.pdf`](Dokumentation/DEVTO_ARTICLE.pdf) — Full article (PDF)
+- [`Dokumentation/2026-02-16_Genesis_Session.txt`](Dokumentation/2026-02-16_Genesis_Session.txt) — The complete build session: 8.5 hours from idea to working prototype
 
 ---
 
