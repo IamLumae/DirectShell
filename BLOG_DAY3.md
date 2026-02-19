@@ -1,8 +1,8 @@
 # Blog 19.02.26
 
-## Migraine, Stress und die Suche nach der Nadel im Heuhaufen.
+## Migraine, Stress, and the Search for the Needle in the Haystack.
 
-Es ist eine interessante Situation. Auf der einen Seite trudeln hier und da interessante Kommentare ein:
+It's an interesting situation. On one hand, cool comments keep trickling in here and there:
 
 > **Ozz** - *Feb 18*
 >
@@ -10,28 +10,28 @@ Es ist eine interessante Situation. Auf der einen Seite trudeln hier und da inte
 >
 > THANKS! :)
 >
-> *(Dev.to Kommentar)*
+> *(Dev.to comment)*
 
-Auf der anderen Seite hat man das Gefuehl nichts bewegt sich. 100 Downloads. Einige Hundert Reads auf den Papern aber es scheint fast wie ein kollektives "das ist interessant aber was machen wir jetzt damit?" zu sein.
+On the other hand, it feels like nothing is moving. 100 downloads. A few hundred reads on the papers, but it almost seems like a collective "this is interesting, but what do we do with it now?"
 
-Vielleicht liegt das einfach daran das noch effektiv die Anwendungen fehlen. DirectShell verspricht Fortschritt aber das ist natuerlich erst dann greifbar wenn die ersten Anwendungen auf Basis von DS entstanden sind die auch praktisch funktionieren.
+Maybe it's simply because the real applications are still missing. DirectShell promises progress, but that only becomes tangible once the first applications built on top of DS actually work in practice.
 
-Ich selbst fokussiere mich auf den KI-Agenten Usecase weil ich glaube das es einer der vielversprechendsten ist aber man merkt auch einfach das man da ploetzlich vor der Situation steht etwas zu bauen zu dem es keine Referenz gibt. Kein "mal kurz Googlen wie mache ich das". Keine Best Practice. Reines Try and Error.
+I'm personally focusing on the AI agent use case because I believe it's one of the most promising — but you also quickly realize you're suddenly in a position where you're building something with no reference. No "let me just Google how to do this." No best practices. Pure trial and error.
 
-Und ich kann euch das sagen: das ist anstrengend.
+And I can tell you: it's exhausting.
 
-## Wo stehe ich?
+## Where do I stand?
 
-Den Gemini-Ansatz der einige der Rohdaten in "Haeppchen zerlegt" habe ich wieder eingestampft. Gestern gedacht es ist klug, heute gemerkt: Nein, ich will deterministische Loesungen auch wenn sie schwerer sind.
+The Gemini approach that chunked some of the raw data into "bite-sized pieces" — I scrapped it. Thought it was clever yesterday, realized today: No, I want deterministic solutions even if they're harder.
 
-Ich habe nun also eine Mechanik in den MCP Server gebaut der die relevanten Daten aus dem CDP Port des Browsers holt, aufbereitet und daraus automatisch die notwendigen Tools dynamisch abbildet.
+So I've now built a mechanism into the MCP server that pulls the relevant data from the browser's CDP port, processes it, and dynamically maps the necessary tools from that.
 
-Also: Kein zusaetzlicher API Call. Keine weiteren Kosten. Das ist gut.
+So: No additional API call. No extra cost. That's good.
 
-Die groesste ungeloeste Frage vor der ich nach wie vor stehe ist wie ich es realisiere das Lernfortschritte der KI direkt in einen Learning Loop gegossen werden koennen. Das Problem ist klar — kannst du der KI sagen "merk dir das". Aber das ist nicht zuverlaessig.
+The biggest unsolved question I'm still facing is how to make AI learning progress flow directly into a learning loop. The problem is clear — sure, you can tell the AI "remember this." But that's not reliable.
 
-Es muss eine Methode her die autonom, deterministisch und zuverlaessig Learnings extrahiert und diese wieder als permanenten Loop-Kontext bewusst in die KI zurueck subventioniert.
+There needs to be a method that autonomously, deterministically, and reliably extracts learnings and feeds them back into the AI as permanent loop context.
 
-Ansonsten gabs einige coole PNs und Anfragen. Einige Meetings sind geplant. Aber noch nichts Konkretes.
+Other than that, there have been some cool DMs and inquiries. A few meetings are planned. But nothing concrete yet.
 
-In dem Sinne — euch einen wunderschoenen Donnerstag <3 der erste von gestern sollte schon irgendwo sein.
+With that — have a wonderful Thursday <3 yesterday's post should be floating around somewhere already.
