@@ -26,7 +26,11 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::*;
-use windows::Win32::System::Threading::{GetCurrentThreadId, AttachThreadInput};
+use windows::Win32::System::Threading::{
+    GetCurrentThreadId, AttachThreadInput,
+    OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_FORMAT,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -60,12 +64,19 @@ const TREE_TIMER: usize = 3;      // Accessibility Tree Dump
 const TREE_MS: u32 = 500;         // 2 Hz — genug Raum für ~200ms Dumps + Puffer
 const INJECT_TIMER: usize = 4;    // Action Queue Processing (eigener Timer)
 const INJECT_MS: u32 = 30;        // 33 Hz — schnelles Typing wie ein Mensch
+const ENUM_TIMER: usize = 5;      // Window Enumeration (Daemon Mode)
+const ENUM_MS: u32 = 2000;        // 2 Hz — alle offenen Fenster tracken
+const SNAP_REQ_TIMER: usize = 6;  // Snap Request Polling (AI-triggered)
+const SNAP_REQ_MS: u32 = 200;     // 5 Hz — schnelle Reaktion auf AI-Befehle
 const MAX_DEPTH: i32 = i32::MAX;  // Primitivum. Kein Limit.
 const MAX_CHILDREN: i32 = i32::MAX; // Primitivum. Kein Limit.
 const STREAM_BATCH: i32 = 200;    // COMMIT alle 200 Elemente → progressive Verfügbarkeit
 const DB_DIR: &str = "ds_profiles";  // Persistente App-DBs
 const ACTIVE_FILE: &str = "ds_profiles/is_active";  // Status für KI-Agents
 const LOG_FILE: &str = "directshell.log";
+const WINDOWS_FILE: &str = "ds_profiles/windows.json";       // Daemon: alle offenen Fenster
+const SNAP_REQUEST_FILE: &str = "ds_profiles/snap_request";   // AI → DS: "snap to this app"
+const SNAP_RESULT_FILE: &str = "ds_profiles/snap_result";     // DS → AI: result JSON
 
 // ── Logging ────────────────────────────────────────
 fn log(msg: &str) {
@@ -99,6 +110,8 @@ static LAST_H: AtomicI32 = AtomicI32::new(0);
 static BTN_OFF_X: AtomicI32 = AtomicI32::new(FALLBACK_BTN_X);
 static DYN_TOP_H: AtomicI32 = AtomicI32::new(DEFAULT_TOP_H);
 static START_TIME: OnceLock<Instant> = OnceLock::new();
+static DS_HWND: AtomicIsize = AtomicIsize::new(0);           // Daemon: eigenes Fenster-Handle
+static DAEMON_SNAP: AtomicBool = AtomicBool::new(false);     // Daemon: skip CDP popup
 
 fn tgt() -> HWND { HWND(TARGET_HW.load(SeqCst) as *mut _) }
 fn snapped() -> bool { IS_SNAPPED.load(SeqCst) }
@@ -1963,6 +1976,12 @@ unsafe fn find_snap(me: HWND) -> Option<HWND> {
 /// Check if target is a browser and CDP is available.
 /// Returns true = proceed with snap. Returns false = snap aborted (browser relaunching).
 unsafe fn ensure_cdp(target: HWND) -> bool {
+    // Daemon mode: skip CDP popup entirely — no user interaction
+    if DAEMON_SNAP.load(SeqCst) {
+        log("ensure_cdp: DAEMON mode — skipping CDP check");
+        return true;
+    }
+
     let mut buf = [0u16; 256];
     let len = GetWindowTextW(target, &mut buf);
     let title = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
@@ -2109,6 +2128,138 @@ unsafe fn do_unsnap(me: HWND) {
     let _ = SetTimer(me, ANIM_TIMER, ANIM_MS, None);
     log("do_unsnap: COMPLETE");
     let _ = InvalidateRect(me, None, TRUE);
+}
+
+// ── Daemon Mode: Background Window Enumeration ──────
+unsafe extern "system" fn enum_windows_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let vec = &mut *(lparam.0 as *mut Vec<isize>);
+    vec.push(hwnd.0 as isize);
+    TRUE
+}
+
+unsafe fn collect_windows() -> Vec<isize> {
+    let mut hwnds: Vec<isize> = Vec::new();
+    let _ = EnumWindows(Some(enum_windows_cb), LPARAM(&mut hwnds as *mut Vec<isize> as isize));
+    hwnds
+}
+
+unsafe fn get_exe_name(pid: u32) -> String {
+    if pid == 0 { return String::new(); }
+    let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) {
+        Ok(h) => h,
+        Err(_) => return String::new(),
+    };
+    let mut buf = [0u16; 260];
+    let mut len = buf.len() as u32;
+    let ok = QueryFullProcessImageNameW(
+        handle, PROCESS_NAME_FORMAT(0), PWSTR(buf.as_mut_ptr()), &mut len,
+    );
+    let _ = CloseHandle(handle);
+    if ok.is_ok() {
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.rsplit('\\').next().unwrap_or("").to_string()
+    } else {
+        String::new()
+    }
+}
+
+unsafe fn enum_windows_to_json() {
+    let ds = HWND(DS_HWND.load(SeqCst) as *mut _);
+    let hwnds = collect_windows();
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut entries = Vec::new();
+
+    for &raw in &hwnds {
+        let hwnd = HWND(raw as *mut _);
+        if !IsWindowVisible(hwnd).as_bool() { continue; }
+        if !ds.0.is_null() && hwnd == ds { continue; }
+        if is_shell(hwnd) { continue; }
+
+        let mut buf = [0u16; 256];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        if len == 0 { continue; }
+        let title = String::from_utf16_lossy(&buf[..len as usize]);
+        if title.trim().is_empty() { continue; }
+
+        let db_path = db_name_from_title(&title);
+        let app = db_path.trim_start_matches("ds_profiles/").trim_end_matches(".db");
+
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let exe = get_exe_name(pid);
+
+        // JSON-escape
+        let title_j = title.replace('\\', "\\\\").replace('"', "\\\"");
+        let app_j = app.replace('\\', "\\\\").replace('"', "\\\"");
+        let exe_j = exe.replace('\\', "\\\\").replace('"', "\\\"");
+        entries.push(format!(
+            r#"    {{"title":"{}","app":"{}","exe":"{}","hwnd":{}}}"#,
+            title_j, app_j, exe_j, raw
+        ));
+    }
+
+    let json = format!(
+        "{{\n  \"timestamp\":{},\n  \"windows\":[\n{}\n  ]\n}}",
+        ts, entries.join(",\n")
+    );
+    let _ = fs::write(WINDOWS_FILE, json);
+}
+
+unsafe fn check_snap_request(me: HWND) {
+    let content = match fs::read_to_string(SNAP_REQUEST_FILE) {
+        Ok(c) => c,
+        Err(_) => return, // No request pending
+    };
+    let _ = fs::remove_file(SNAP_REQUEST_FILE);
+    let requested = content.trim().to_lowercase();
+    if requested.is_empty() { return; }
+    log(&format!("snap_request: looking for '{}'", requested));
+
+    let ds = HWND(DS_HWND.load(SeqCst) as *mut _);
+    let hwnds = collect_windows();
+    let mut target_hwnd: Option<HWND> = None;
+
+    for &raw in &hwnds {
+        let hwnd = HWND(raw as *mut _);
+        if !IsWindowVisible(hwnd).as_bool() { continue; }
+        if !ds.0.is_null() && hwnd == ds { continue; }
+        if is_shell(hwnd) { continue; }
+
+        let mut buf = [0u16; 256];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        if len == 0 { continue; }
+        let title = String::from_utf16_lossy(&buf[..len as usize]);
+
+        let db_path = db_name_from_title(&title);
+        let app = db_path.trim_start_matches("ds_profiles/").trim_end_matches(".db");
+        if app == requested {
+            target_hwnd = Some(hwnd);
+            break;
+        }
+    }
+
+    match target_hwnd {
+        Some(target) => {
+            log(&format!("snap_request: found '{}' at 0x{:X}", requested, target.0 as usize));
+            // Already snapped to this exact window?
+            if snapped() && tgt() == target {
+                let _ = fs::write(SNAP_RESULT_FILE,
+                    format!(r#"{{"status":"ok","app":"{}"}}"#, requested));
+                return;
+            }
+            if snapped() { do_unsnap(me); }
+            DAEMON_SNAP.store(true, SeqCst);
+            do_snap(me, target);
+            DAEMON_SNAP.store(false, SeqCst);
+            let _ = fs::write(SNAP_RESULT_FILE,
+                format!(r#"{{"status":"ok","app":"{}"}}"#, requested));
+        }
+        None => {
+            log(&format!("snap_request: '{}' NOT FOUND", requested));
+            let _ = fs::write(SNAP_RESULT_FILE,
+                format!(r#"{{"status":"error","reason":"No window matching '{}' found"}}"#, requested));
+        }
+    }
 }
 
 // ── Position Sync (60fps) ───────────────────────────
@@ -2479,6 +2630,8 @@ unsafe extern "system" fn wndproc(
                 ANIM_TIMER => { let _ = InvalidateRect(hwnd, None, FALSE); },
                 TREE_TIMER => { dump_tree(); },
                 INJECT_TIMER => { process_injections(); },
+                ENUM_TIMER => { enum_windows_to_json(); },
+                SNAP_REQ_TIMER => { check_snap_request(hwnd); },
                 _ => {}
             }
             LRESULT(0)
@@ -2513,6 +2666,16 @@ unsafe extern "system" fn wndproc(
 }
 
 fn main() -> Result<()> {
+    // ── Single-Instance Guard ────────────────────────────────────────
+    // Only one DirectShell may run at a time.
+    // Window class "DirectShell" is unique — if it already exists, bail out.
+    if let Ok(existing) = unsafe { FindWindowW(w!("DirectShell"), None) } {
+        if existing != HWND::default() {
+            eprintln!("DirectShell is already running. Exiting.");
+            std::process::exit(0);
+        }
+    }
+
     // Log-Datei bei Start leeren
     let _ = fs::write(LOG_FILE, "");
     log("=== DirectShell START ===");
@@ -2557,8 +2720,15 @@ fn main() -> Result<()> {
 
         SetLayeredWindowAttributes(hwnd, INVIS, ALPHA, LWA_COLORKEY | LWA_ALPHA)?;
         log(&format!("Window created: 0x{:X}", hwnd.0 as usize));
+        DS_HWND.store(hwnd.0 as isize, SeqCst);
 
         let _ = SetTimer(hwnd, ANIM_TIMER, ANIM_MS, None);
+
+        // Daemon Mode: Background window enumeration + snap request polling
+        let _ = fs::create_dir_all(DB_DIR);
+        let _ = SetTimer(hwnd, ENUM_TIMER, ENUM_MS, None);
+        let _ = SetTimer(hwnd, SNAP_REQ_TIMER, SNAP_REQ_MS, None);
+        log("Daemon mode: ENUM_TIMER + SNAP_REQ_TIMER started");
 
         // Keyboard Hook installieren (global, low-level)
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook_proc), hinst, 0)?;

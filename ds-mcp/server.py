@@ -73,37 +73,46 @@ mcp = FastMCP(
         "Universal GUI control for any desktop application. "
         "Read any screen as structured text. Control any app via named elements. "
         "Powered by DirectShell and the Windows Accessibility Layer.\n\n"
-        "## Element Type Prefixes (ds_state output)\n"
-        "Every element in ds_state has a type prefix that tells you HOW to interact with it:\n"
-        "- [click]    = Button, link, or clickable element. Use ds_click.\n"
-        "- [keyboard] = Text input field (Edit, TextBox). Use ds_text or ds_type, then ds_click to focus first.\n"
-        "- [select]   = Dropdown, combobox, or search field with suggestions. Use ds_click to focus, ds_type to enter text.\n\n"
-        "## Critical: Distinguish inputs from buttons!\n"
-        "A search area typically has TWO elements:\n"
-        "  [select] \"Suchen\"  ← this is the INPUT FIELD (type text here)\n"
-        "  [click]  \"Search\"  ← this is the SUBMIT BUTTON (click after typing)\n"
-        "Always identify the input field first, type into it, THEN click the submit button.\n\n"
-        "## Workflow: Read → Understand → Act\n"
-        "1. ds_state() to see what's on screen (compact, numbered list)\n"
-        "2. Identify the right elements by their type prefix and name\n"
-        "3. For text input: ds_click on the [keyboard]/[select] field → ds_type the text → ds_key('enter') or ds_click the submit button\n"
-        "4. For buttons: ds_click on the [click] element\n"
-        "5. ds_state() again to verify the result\n\n"
-        "## Pro Tip: Zoom Out for Content-Heavy Pages\n"
-        "You read the accessibility tree, not pixels. You don't need readable font sizes.\n"
-        "When a page has lots of content (chat responses, articles, docs):\n"
-        "1. Zoom out: ds_key('ctrl+minus') x8 (gets to ~25%)\n"
-        "2. Read everything at once with ds_screen() — ALL content in one shot\n"
-        "3. Zoom back: ds_key('ctrl+0') to reset for the human\n"
-        "This beats scrolling in every way: no focus issues, no multi-step loops, one read = complete content.\n\n"
-        "## Live Events (Delta Perception)\n"
-        "DirectShell captures live UIA events and writes them to an `events` table.\n"
-        "Use ds_events() to get only what CHANGED since your last check — ~50 tokens vs ~5000 for full tree.\n"
-        "Event types: automation (window/menu/content_loaded), property (Name/Value/Toggle/Enabled changes), "
-        "structure (DOM mutations — child added/removed/invalidated).\n"
-        "Best practice: ds_click('Save') → ds_events() → see exactly what happened, without re-reading the full tree."
+        "**NEW TO DIRECTSHELL? Call ds_guide() first.** It explains every tool and the workflow.\n\n"
+        "**Quick start:** ds_apps() → ds_focus('app') → ds_update_view() → ds_act(N)"
     ),
 )
+
+# ---------------------------------------------------------------------------
+# Action Logger — deterministic learning loop
+# ---------------------------------------------------------------------------
+
+_ACTION_LOG_DIR = PROFILES_DIR / "action_log"
+
+def _log_action(tool_name: str, params: dict, result: str, prev_ok: str):
+    """Log an MCP action with success feedback from previous action. Never raises."""
+    try:
+        _ACTION_LOG_DIR.mkdir(exist_ok=True)
+        ctx = {}
+        try:
+            if _is_cdp_available():
+                ctx["mode"] = "cdp"
+            else:
+                status = _read_active()
+                ctx["mode"] = "uia"
+                ctx["app"] = status.get("app", "unknown")
+        except Exception:
+            ctx["mode"] = "unknown"
+        entry = {
+            "ts": time.time(),
+            "tool": tool_name,
+            "params": params,
+            "result": result[:200] if result else "",
+            "prev_ok": prev_ok,
+            **ctx,
+        }
+        from datetime import datetime
+        log_file = _ACTION_LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # logging must never break tool execution
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -133,11 +142,9 @@ def _get_snapped_app() -> str:
 
 
 def _learning_hint() -> str:
-    """Return a short reminder to save learnings after actions."""
+    """Short reminder to save learnings after actions."""
     app = _get_snapped_app()
-    if not app:
-        return ""
-    return f"Tip: Save discoveries with ds_learn('{app}', '<context>', append='...')"
+    return f" | tip: ds_learn('{app}', '<context>')" if app else ""
 
 
 def _get_db_path(app: Optional[str] = None) -> Path:
@@ -174,6 +181,273 @@ def _db_query(sql: str, app: Optional[str] = None) -> list[dict]:
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+# --- Shared CSS selector for interactive elements (used by extract, click, type) ---
+_INTERACTIVE_SELECTORS = 'input,textarea,select,button,[role="button"],[role="textbox"],[role="menuitem"],[role="link"],[role="checkbox"],[role="radio"],[role="combobox"],[role="searchbox"],[role="tab"],[role="option"],[role="listitem"],[role="treeitem"],[role="gridcell"],[role="switch"],[role="slider"],[contenteditable="true"],[tabindex],a[href]'
+
+# --- Shared JS for viewport-only text extraction (used by ds_update_view + ds_screen) ---
+_VIEWPORT_TEXT_JS = r'''(() => {
+    const vh = window.innerHeight;
+    const blockTags = new Set(['P','H1','H2','H3','H4','H5','H6','LI','TD','TH','DT','DD','PRE','BLOCKQUOTE','FIGCAPTION','ARTICLE','SECTION','HEADER','FOOTER','MAIN','ASIDE','NAV','DIV','SPAN','A','LABEL']);
+    const blocks = document.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,td,th,dt,dd,pre,blockquote,figcaption,label,span,div,a,article,section');
+    const parts = [], seen = new Set();
+    for (const el of blocks) {
+        const r = el.getBoundingClientRect();
+        if (!r.height || r.bottom < 0 || r.top > vh) continue;
+        if (r.height > vh * 1.5) continue;
+        const s = getComputedStyle(el);
+        if (s.opacity === '0' || s.visibility === 'hidden' || s.display === 'none') continue;
+        let hasBlockChild = false;
+        for (const child of el.children) {
+            if (blockTags.has(child.tagName) && child.getBoundingClientRect().height > 0) {
+                const cs = getComputedStyle(child);
+                if (cs.display !== 'inline' && cs.display !== 'inline-block') { hasBlockChild = true; break; }
+            }
+        }
+        if (hasBlockChild) continue;
+        const t = el.innerText?.trim();
+        if (!t || t.length < 2 || seen.has(t)) continue;
+        seen.add(t);
+        parts.push(t);
+    }
+    return parts.join('\n');
+})()'''
+
+# --- JS for full-page text extraction (used by ds_print) ---
+_FULLPAGE_TEXT_JS = r'''(() => {
+    const blockTags = new Set(['P','H1','H2','H3','H4','H5','H6','LI','TD','TH','DT','DD','PRE','BLOCKQUOTE','FIGCAPTION','ARTICLE','SECTION','HEADER','FOOTER','MAIN','ASIDE','NAV','DIV','SPAN','A','LABEL']);
+    const blocks = document.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,td,th,dt,dd,pre,blockquote,figcaption,label,span,div,a,article,section');
+    const parts = [], seen = new Set();
+    for (const el of blocks) {
+        const r = el.getBoundingClientRect();
+        if (!r.height) continue;
+        const s = getComputedStyle(el);
+        if (s.opacity === '0' || s.visibility === 'hidden' || s.display === 'none') continue;
+        let hasBlockChild = false;
+        for (const child of el.children) {
+            if (blockTags.has(child.tagName) && child.getBoundingClientRect().height > 0) {
+                const cs = getComputedStyle(child);
+                if (cs.display !== 'inline' && cs.display !== 'inline-block') { hasBlockChild = true; break; }
+            }
+        }
+        if (hasBlockChild) continue;
+        const t = el.innerText?.trim();
+        if (!t || t.length < 2 || seen.has(t)) continue;
+        seen.add(t);
+        parts.push(t);
+    }
+    return parts.join('\n');
+})()'''
+
+
+def _is_cdp_available() -> bool:
+    """Check if CDP (Chrome DevTools Protocol) is available on port 9222.
+    If yes → browser mode (all actions via CDP). If no → native app mode (all actions via UIA)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        result = s.connect_ex(("127.0.0.1", 9222))
+        s.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+_cdp_active_tab_id: Optional[str] = None  # Track which tab we're focused on
+
+def _cdp_tabs() -> list[dict]:
+    """Get all CDP browser tabs."""
+    return requests.get("http://127.0.0.1:9222/json/list", timeout=2).json()
+
+def _cdp_ws(tab_id: Optional[str] = None):
+    """Get a CDP websocket connection. Uses tracked active tab, or first page tab."""
+    import websocket as _ws
+    tabs = _cdp_tabs()
+    target_id = tab_id or _cdp_active_tab_id
+
+    if target_id:
+        tab = next((t for t in tabs if t.get("id") == target_id and "webSocketDebuggerUrl" in t), None)
+        if tab:
+            return _ws.create_connection(tab["webSocketDebuggerUrl"], timeout=5)
+
+    # Fallback: first page tab
+    page_tab = next((t for t in tabs if t.get("type") == "page" and "webSocketDebuggerUrl" in t), None)
+    if not page_tab:
+        raise RuntimeError("No CDP page tab found")
+    return _ws.create_connection(page_tab["webSocketDebuggerUrl"], timeout=5)
+
+
+def _cdp_click(element_name: str) -> str:
+    """Click a DOM element by label via CDP — real mouse events at element center."""
+    ws = _cdp_ws()
+    safe = element_name.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+    # Step 1: Find element and return its center coordinates
+    js = f"""(() => {{
+        const target = '{safe}';
+        const selectors = '{_INTERACTIVE_SELECTORS}';
+        for (const el of document.querySelectorAll(selectors)) {{
+            const label = el.getAttribute('aria-label') || el.placeholder || (el.textContent||'').trim().substring(0,60) || el.name || el.id;
+            if (label === target) {{
+                const r = el.getBoundingClientRect();
+                return JSON.stringify({{x: r.x + r.width/2, y: r.y + r.height/2}});
+            }}
+        }}
+        return 'not_found';
+    }})()"""
+    ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": js, "returnByValue": True}}))
+    result = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", "error")
+    if result == "not_found":
+        ws.close()
+        raise RuntimeError(f"CDP: '{element_name}' not found")
+    coords = json.loads(result)
+    x, y = coords["x"], coords["y"]
+    # Step 2: Dispatch real mouse events at element center
+    for eid, method_type in [(2, "mousePressed"), (3, "mouseReleased")]:
+        ws.send(json.dumps({"id": eid, "method": "Input.dispatchMouseEvent", "params": {
+            "type": method_type, "x": x, "y": y, "button": "left", "clickCount": 1
+        }}))
+        ws.recv()
+    ws.close()
+    return "clicked"
+
+
+def _cdp_type(text: str, target: str = "") -> str:
+    """Type text via CDP — simulated keyboard events for every character. Works everywhere."""
+    ws = _cdp_ws()
+    if target:
+        safe = target.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+        js = f"""(() => {{
+            const t = '{safe}';
+            const selectors = '{_INTERACTIVE_SELECTORS}';
+            for (const el of document.querySelectorAll(selectors)) {{
+                const label = el.getAttribute('aria-label') || el.placeholder || (el.textContent||'').trim().substring(0,60) || el.name || el.id;
+                if (label === t) {{
+                    const r = el.getBoundingClientRect();
+                    return JSON.stringify({{x: r.x + r.width/2, y: r.y + r.height/2}});
+                }}
+            }}
+            return 'not_found';
+        }})()"""
+        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": js, "returnByValue": True}}))
+        result = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", "error")
+        if result == "not_found":
+            ws.close()
+            raise RuntimeError(f"CDP: '{target}' not found")
+        coords = json.loads(result)
+        x, y = coords["x"], coords["y"]
+        # Real click to focus the input field
+        for eid, method_type in [(10, "mousePressed"), (11, "mouseReleased")]:
+            ws.send(json.dumps({"id": eid, "method": "Input.dispatchMouseEvent", "params": {
+                "type": method_type, "x": x, "y": y, "button": "left", "clickCount": 1
+            }}))
+            ws.recv()
+    # Simulated keyboard — keyDown → keyUp for all keys.
+    # Regular chars + Enter: keyDown with "text" property. Tab: keyDown without text.
+    # NO "char" events (causes double input).
+    special_keys = {
+        "\t": ("Tab", "Tab", 9, None),      # no text
+        "\n": ("Enter", "Enter", 13, "\r"),  # text=\r (Puppeteer convention)
+    }
+    msg_id = 20
+    for ch in text:
+        if ch in special_keys:
+            key_val, code, vk, txt = special_keys[ch]
+            params = {"type": "keyDown", "key": key_val, "code": code,
+                      "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+            if txt:
+                params["text"] = txt
+            ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": params}))
+            ws.recv(); msg_id += 1
+            ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": {
+                "type": "keyUp", "key": key_val, "code": code,
+                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk
+            }}))
+            ws.recv(); msg_id += 1
+        else:
+            kc = ord(ch.upper()) if ch.isalpha() else ord(ch)
+            cd = f"Key{ch.upper()}" if ch.isalpha() else ""
+            # keyDown with text → inserts the character
+            ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": {
+                "type": "keyDown", "key": ch, "text": ch,
+                "code": cd, "windowsVirtualKeyCode": kc, "nativeVirtualKeyCode": kc
+            }}))
+            ws.recv(); msg_id += 1
+            # keyUp — no text needed
+            ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": {
+                "type": "keyUp", "key": ch,
+                "code": cd, "windowsVirtualKeyCode": kc, "nativeVirtualKeyCode": kc
+            }}))
+            ws.recv(); msg_id += 1
+    ws.close()
+    return "typed"
+
+
+def _cdp_key(combo: str) -> str:
+    """Press a key combo via CDP Input.dispatchKeyEvent."""
+    # Parse combo: "ctrl+shift+a" → modifiers + key
+    parts = combo.lower().split("+")
+    key = parts[-1]
+    modifiers = 0
+    if "alt" in parts[:-1]: modifiers |= 1
+    if "ctrl" in parts[:-1]: modifiers |= 2
+    if "shift" in parts[:-1]: modifiers |= 8
+
+    # Map common key names to CDP key codes
+    key_map = {
+        "enter": ("Enter", "Enter", 13), "tab": ("Tab", "Tab", 9),
+        "escape": ("Escape", "Escape", 27), "backspace": ("Backspace", "Backspace", 8),
+        "delete": ("Delete", "Delete", 46), "space": (" ", "Space", 32),
+        "pagedown": ("PageDown", "PageDown", 34), "pageup": ("PageUp", "PageUp", 33),
+        "home": ("Home", "Home", 36), "end": ("End", "End", 35),
+        "arrowup": ("ArrowUp", "ArrowUp", 38), "arrowdown": ("ArrowDown", "ArrowDown", 40),
+        "arrowleft": ("ArrowLeft", "ArrowLeft", 37), "arrowright": ("ArrowRight", "ArrowRight", 39),
+        "f5": ("F5", "F5", 116),
+    }
+
+    if key in key_map:
+        key_val, code, vk = key_map[key]
+    elif len(key) == 1:
+        key_val, code, vk = key, f"Key{key.upper()}", ord(key.upper())
+    else:
+        key_val, code, vk = key, key, 0
+
+    ws = _cdp_ws()
+    for evt in ["keyDown", "keyUp"]:
+        ws.send(json.dumps({"id": 1, "method": "Input.dispatchKeyEvent", "params": {
+            "type": evt, "key": key_val, "code": code,
+            "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
+            "modifiers": modifiers
+        }}))
+        ws.recv()
+    ws.close()
+    return "ok"
+
+
+def _cdp_scroll(direction: str, amount: int = 1) -> str:
+    """Scroll via CDP JavaScript window.scrollBy — more reliable than mouseWheel events."""
+    # Each notch ~100px
+    px = 100 * amount
+    if direction == "down": js = f"window.scrollBy(0, {px})"
+    elif direction == "up": js = f"window.scrollBy(0, -{px})"
+    elif direction == "right": js = f"window.scrollBy({px}, 0)"
+    elif direction == "left": js = f"window.scrollBy(-{px}, 0)"
+    else: js = "null"
+
+    ws = _cdp_ws()
+    ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": js, "returnByValue": True}}))
+    ws.recv()
+    ws.close()
+    return "ok"
+
+
+def _cdp_navigate(url: str) -> str:
+    """Navigate the browser to a URL via CDP."""
+    ws = _cdp_ws()
+    ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": url}}))
+    ws.recv()
+    ws.close()
+    return "ok"
 
 
 def _inject_action(action: str, text: str = "", target: str = "", app: Optional[str] = None, wait: bool = True) -> int:
@@ -228,6 +502,11 @@ def _wait_for_action(action_id: int, db_path: Path, timeout: float = 5.0, poll_i
     # Timeout — return anyway, action might still execute
 
 
+def _with_chars(text: str) -> str:
+    """Append char count to output for tracking."""
+    return f"{text}\n({len(text)} chars)"
+
+
 def _load_profiles() -> dict:
     """Load app profiles from JSON file."""
     if PROFILES_JSON.exists():
@@ -247,104 +526,335 @@ def _save_profiles(profiles: dict):
 # READ TOOLS — Perceive the screen
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-def ds_status() -> dict:
-    """Check if DirectShell is snapped to an application.
+GUIDE_PATH = Path(__file__).resolve().parent / "GUIDE.md"
 
-    Returns the current state: which app is snapped,
-    and paths to all output files. Call this first to know
-    what DirectShell is currently attached to.
+@mcp.tool()
+def ds_guide(prev_ok: str) -> str:
+    """Read this FIRST before using any other DirectShell tool.
+
+    Returns the complete quick-start guide: which tool to call first,
+    what each tool does, and the standard workflow.
+
+    DirectShell has two modes:
+    - Browser mode (CDP): When a Chromium browser runs with --remote-debugging-port=9222.
+      Uses Chrome DevTools Protocol for all interactions. Tools: ds_tabs, ds_tab, ds_navigate, ds_update_view, ds_screen, ds_click, ds_text, ds_type, ds_key, ds_scroll, ds_batch, ds_act.
+    - Native app mode (UIA): For all other desktop applications (Discord, Notepad, SAP, etc.).
+      Uses Windows UI Automation. Tools: ds_apps, ds_focus, ds_state, ds_elements, ds_query, ds_find, ds_events, plus all action tools.
+
+    ds_update_view() works in BOTH modes and is always the best starting point.
+
+    Args:
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
+    """
+    if GUIDE_PATH.exists():
+        return GUIDE_PATH.read_text(encoding="utf-8")
+    return "GUIDE.md not found next to server.py."
+
+
+@mcp.tool()
+def ds_status(prev_ok: str) -> dict:
+    """Check if DirectShell is snapped to a native application (UIA mode).
+
+    Returns {snapped: true/false, app: "name"}.
+    Not needed for browser mode — use ds_tabs() instead.
+
+    Args:
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
     status = _read_active()
-    if status["snapped"]:
-        app = status["app"]
-        status["files"] = {
-            "db": str(PROFILES_DIR / f"{app}.db"),
-            "snap": str(PROFILES_DIR / f"{app}.snap"),
-            "a11y": str(PROFILES_DIR / f"{app}.a11y"),
-            "a11y_snap": str(PROFILES_DIR / f"{app}.a11y.snap"),
-        }
-        # List all previously snapped apps
-        status["known_apps"] = sorted(set(
-            p.stem for p in PROFILES_DIR.glob("*.db")
-        ))
-    return status
+    return {"snapped": status["snapped"], "app": status["app"]}
 
 
 @mcp.tool()
-def ds_state(app: Optional[str] = None) -> str:
-    """Get the current screen state as a compact numbered list of operable elements.
+def ds_apps(prev_ok: str) -> str:
+    """List all open desktop applications (UIA mode, for native apps).
 
-    This is the primary perception tool. Returns numbered elements like:
-    [1] [keyboard] "Search Box" @ 100,200 (300x30)
-    [2] [click] "Save" @ 500,600 (80x25)
-
-    Use these element names with ds_click, ds_text, ds_type.
+    Returns which app is currently focused and all available apps.
+    Use ds_focus(app) to switch to one. For browser tabs, use ds_tabs() instead.
 
     Args:
-        app: Optional app name. If omitted, uses the currently snapped app.
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
-    # NOTE for LLMs: The type prefix tells you what the element IS:
-    #   [click]    = button/link → use ds_click
-    #   [keyboard] = text input  → use ds_text or ds_click + ds_type
-    #   [select]   = combobox/search field → use ds_click + ds_type
-    return _read_file(".a11y.snap", app)
+    windows_file = PROFILES_DIR / "windows.json"
+    if not windows_file.exists():
+        return "DirectShell daemon not running. Wait 2 seconds and retry."
+    data = json.loads(windows_file.read_text(encoding="utf-8"))
+    status = _read_active()
+    focused = status["app"] if status["snapped"] else "none"
+    apps = sorted(set(w["app"] for w in data.get("windows", [])))
+    result = f"Focused: {focused}\nApps: {', '.join(apps)}"
+    return _with_chars(result)
 
 
 @mcp.tool()
-def ds_screen(app: Optional[str] = None) -> str:
-    """Get the full screen reader view with focus, input targets, and all visible content.
+def ds_focus(app: str, prev_ok: str) -> dict:
+    """Switch to a native desktop application (UIA mode).
 
-    More detailed than ds_state. Includes:
-    - Focus: what element currently has keyboard focus
-    - Input Targets: all text fields with their current values
-    - Content: all visible text, links, labels
-
-    Use this when you need full context about what's on screen.
+    Snaps DirectShell to the named app so it can read its UI and receive actions.
+    The app must appear in ds_apps() output. For browser tabs, use ds_tab() instead.
 
     Args:
-        app: Optional app name. If omitted, uses the currently snapped app.
+        app: Application name as shown in ds_apps() (e.g., "discord", "notepad")
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
-    return _read_file(".a11y", app)
+    # Clean up any old result
+    result_file = PROFILES_DIR / "snap_result"
+    if result_file.exists():
+        result_file.unlink()
+
+    # Write snap request
+    req_file = PROFILES_DIR / "snap_request"
+    req_file.write_text(app.strip(), encoding="utf-8")
+
+    # Wait for result (DS polls every 200ms, snap takes ~500ms)
+    for _ in range(30):  # 3 seconds max
+        time.sleep(0.1)
+        if result_file.exists():
+            try:
+                result = json.loads(result_file.read_text(encoding="utf-8"))
+                result_file.unlink()
+                return result
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    # Timeout — check if is_active changed
+    status = _read_active()
+    if status["snapped"] and status["app"] == app.strip().lower():
+        return {"status": "ok", "app": app}
+    return {"status": "timeout", "reason": f"DirectShell did not snap to '{app}' within 3 seconds."}
 
 
 @mcp.tool()
-def ds_elements(app: Optional[str] = None) -> str:
-    """Get all interactive elements with their input type classification.
+def ds_tabs(prev_ok: str) -> str:
+    """List all open browser tabs (CDP/browser mode).
 
-    Returns every interactive, enabled, visible element with:
-    - Input type: [keyboard], [click], [select]
-    - Element name
-    - Position and size
-    - Automation ID (if available)
-
-    More complete than ds_state but less contextual than ds_screen.
-
-    Type prefixes: [click] = button/link, [keyboard] = text input, [select] = combobox/search field.
+    Returns numbered list: [1] Page Title | https://url.com
+    Active tab marked with *. Use ds_tab(number_or_name) to switch.
+    Requires browser running with --remote-debugging-port=9222.
 
     Args:
-        app: Optional app name. If omitted, uses the currently snapped app.
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
-    return _read_file(".snap", app)
+    if not _is_cdp_available():
+        return "CDP not available. Browser not running with --remote-debugging-port=9222."
+    tabs = _cdp_tabs()
+    page_tabs = [t for t in tabs if t.get("type") == "page"]
+    lines = []
+    for i, t in enumerate(page_tabs, 1):
+        active = " *" if t.get("id") == _cdp_active_tab_id else ""
+        lines.append(f"[{i}]{active} {t.get('title', '?')} | {t.get('url', '?')}")
+    result = "\n".join(lines) if lines else "No tabs found."
+    return _with_chars(result)
 
 
 @mcp.tool()
-def ds_query(sql: str, app: Optional[str] = None) -> list[dict]:
-    """Run a SQL query against the DirectShell element database.
+def ds_tab(identifier: str, prev_ok: str) -> str:
+    """Switch to a browser tab by number or name (CDP/browser mode).
 
-    The 'elements' table contains every UI element:
-    - id, parent_id, depth, role, name, value, automation_id
-    - enabled (1/0), offscreen (1/0)
-    - x, y, w, h (position and size)
+    After switching, call ds_update_view() to read the new tab's content.
+
+    Args:
+        identifier: Tab number from ds_tabs() (e.g., "3") or part of tab title (e.g., "gmail").
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
+    """
+    global _cdp_active_tab_id
+    if not _is_cdp_available():
+        return "CDP not available."
+    tabs = _cdp_tabs()
+    page_tabs = [t for t in tabs if t.get("type") == "page"]
+    if not page_tabs:
+        return "No tabs found."
+
+    target = None
+    # Try as number first
+    try:
+        idx = int(identifier) - 1
+        if 0 <= idx < len(page_tabs):
+            target = page_tabs[idx]
+    except ValueError:
+        pass
+
+    # Try as name match
+    if not target:
+        search = identifier.lower()
+        target = next((t for t in page_tabs if search in t.get("title", "").lower()), None)
+        if not target:
+            target = next((t for t in page_tabs if search in t.get("url", "").lower()), None)
+
+    if not target:
+        return f"No tab matching '{identifier}'. Use ds_tabs() to see available tabs."
+
+    # Activate via CDP
+    import websocket as _ws
+    ws = _ws.create_connection(target["webSocketDebuggerUrl"], timeout=5)
+    ws.send(json.dumps({"id": 1, "method": "Page.bringToFront", "params": {}}))
+    ws.recv()
+    ws.close()
+    _cdp_active_tab_id = target["id"]
+    r = f"Switched to: {target.get('title', '?')}"
+    _log_action("ds_tab", {"identifier": identifier}, r, prev_ok)
+    return r
+
+
+@mcp.tool()
+def ds_navigate(url: str, prev_ok: str) -> str:
+    """Navigate the active browser tab to a URL (CDP/browser mode).
+
+    Loads the URL in the current tab. Call ds_wait() after to ensure the page loaded,
+    then ds_update_view() to read the new content.
+
+    Args:
+        url: Full URL including https:// (e.g., "https://example.com").
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
+    """
+    if not _is_cdp_available():
+        return "CDP not available."
+    ws = _cdp_ws()
+    ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": url}}))
+    result = json.loads(ws.recv())
+    ws.close()
+    frame_id = result.get("result", {}).get("frameId", "")
+    r = f"Navigated to {url}" if frame_id else f"Navigation sent to {url}"
+    _log_action("ds_navigate", {"url": url}, r, prev_ok)
+    return r
+
+
+@mcp.tool()
+def ds_wait(prev_ok: str, seconds: float = 2.0) -> str:
+    """Wait for a browser page to finish loading (CDP/browser mode).
+
+    Call this after ds_navigate() or ds_click() on a link before reading content.
+    Waits for the DOM to reach 'complete' state, or falls back to a timed wait.
+
+    Args:
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
+        seconds: Maximum seconds to wait (default 2.0, max 10.0).
+    """
+    seconds = min(seconds, 10.0)
+    if not _is_cdp_available():
+        time.sleep(seconds)
+        return "waited (no CDP)"
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            ws = _cdp_ws()
+            ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+                "expression": "document.readyState", "returnByValue": True
+            }}))
+            state = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", "")
+            ws.close()
+            if state == "complete":
+                return f"ready ({state})"
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return f"timeout after {seconds}s"
+
+
+@mcp.tool()
+def ds_state(prev_ok: str, app: Optional[str] = None) -> str:
+    """Get operable UI elements from the accessibility tree (UIA/native app mode only).
+
+    Returns numbered elements with type prefixes:
+    [1] [keyboard] "Search Box" @ 100,200 (300x30)  → text input, use ds_text
+    [2] [click] "Save" @ 500,600 (80x25)            → button, use ds_click
+
+    NOTE: This reads UIA data. For browsers, use ds_update_view() instead (uses CDP).
+
+    Args:
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
+        app: Optional app name. If omitted, uses the currently snapped app.
+    """
+    return _with_chars(_read_file(".a11y.snap", app))
+
+
+@mcp.tool()
+def ds_screen(prev_ok: str, app: Optional[str] = None) -> str:
+    """Get all text currently visible in the viewport — nothing hidden or off-screen.
+
+    In browser mode (CDP): extracts only viewport-rendered text from the DOM.
+    In native mode (UIA): reads the accessibility screen reader view.
+
+    Use this when you need just the text without the tool list. For text + tools, use ds_update_view().
+
+    Args:
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
+        app: Optional app name. If omitted, uses the currently snapped app.
+    """
+    if _is_cdp_available():
+        try:
+            ws = _cdp_ws()
+            # Viewport-only text — leaf blocks only (no duplication)
+            js = _VIEWPORT_TEXT_JS
+            ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+                "expression": js, "returnByValue": True
+            }}))
+            text = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", "")
+            ws.close()
+            return _with_chars(text.strip()) if text else "(empty page)"
+        except Exception:
+            pass
+    return _with_chars(_read_file(".a11y", app))
+
+
+@mcp.tool()
+def ds_print(prev_ok: str) -> str:
+    """Read the ENTIRE page content, not just the viewport (CDP/browser mode only).
+
+    Like a print preview — returns all text on the page from top to bottom.
+    Use this when you need to read a full article, documentation page, or any
+    content that extends beyond the current viewport.
+
+    For viewport-only text, use ds_screen() instead.
+
+    Args:
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
+    """
+    if not _is_cdp_available():
+        return "ds_print requires a browser with CDP (port 9222)."
+    try:
+        ws = _cdp_ws()
+        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+            "expression": _FULLPAGE_TEXT_JS, "returnByValue": True
+        }}))
+        text = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", "")
+        ws.close()
+        return _with_chars(text.strip()) if text else "(empty page)"
+    except Exception as e:
+        return f"CDP error: {e}"
+
+
+@mcp.tool()
+def ds_elements(prev_ok: str, app: Optional[str] = None) -> str:
+    """Get all interactive elements with type, name, position and automation ID (UIA/native app mode only).
+
+    Type prefixes: [click] = button/link, [keyboard] = text input, [select] = dropdown.
+    NOTE: This reads UIA data. For browsers, use ds_update_view() instead (uses CDP).
+
+    Args:
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
+        app: Optional app name. If omitted, uses the currently snapped app.
+    """
+    return _with_chars(_read_file(".snap", app))
+
+
+@mcp.tool()
+def ds_query(sql: str, prev_ok: str, app: Optional[str] = None) -> list[dict]:
+    """Run a SQL query against the DirectShell element database (UIA/native app mode only).
+
+    The 'elements' table has columns: id, parent_id, depth, role, name, value,
+    automation_id, enabled (1/0), offscreen (1/0), x, y, w, h.
 
     Examples:
         "SELECT name, value FROM elements WHERE role='Edit'"
         "SELECT name FROM elements WHERE role='Button' AND enabled=1"
         "SELECT count(*) as n FROM elements WHERE name LIKE '%unread%'"
-        "SELECT role, COUNT(*) as n FROM elements GROUP BY role ORDER BY n DESC"
+
+    NOTE: Only works for native apps (UIA). Not available in browser/CDP mode.
 
     Args:
         sql: A SELECT query. Write queries are not allowed.
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
         app: Optional app name. If omitted, uses the currently snapped app.
     """
     sql_lower = sql.strip().lower()
@@ -354,19 +864,14 @@ def ds_query(sql: str, app: Optional[str] = None) -> list[dict]:
 
 
 @mcp.tool()
-def ds_find(name_pattern: str, app: Optional[str] = None) -> list[dict]:
-    """Find elements by name pattern.
+def ds_find(name_pattern: str, prev_ok: str, app: Optional[str] = None) -> list[dict]:
+    """Find UI elements by name pattern (UIA/native app mode only).
 
-    Searches for elements whose name matches the pattern (case-insensitive).
-    Uses SQL LIKE — use % as wildcard.
+    Uses SQL LIKE matching (% = wildcard). Examples:
+        ds_find("Save")       → exact match
+        ds_find("%invoice%")  → contains "invoice"
 
-    Examples:
-        ds_find("Save")           — exact match
-        ds_find("%invoice%")      — contains "invoice"
-        ds_find("Customer%")      — starts with "Customer"
-
-    Returns matching elements with id, role, name, value, automation_id,
-    enabled, offscreen, position.
+    NOTE: Only works for native apps (UIA). Not available in browser/CDP mode.
 
     Args:
         name_pattern: Search pattern. Use % as wildcard.
@@ -517,26 +1022,17 @@ def _distill_events(raw: list[dict]) -> dict:
 
 
 @mcp.tool()
-def ds_events(app: Optional[str] = None, mark_consumed: bool = True) -> dict:
-    """Get new (unconsumed) UI events since last check.
+def ds_events(prev_ok: str, app: Optional[str] = None, mark_consumed: bool = True) -> dict:
+    """Get UI events since last check — what changed on screen (UIA/native app mode only).
 
-    Returns live events from UIA event handlers:
-    - automation: window_opened, menu_opened, content_loaded
-    - property: Name/Value/ToggleState/IsEnabled changes on elements
-    - structure: child_added, child_removed, children_invalidated, etc.
+    Returns condensed digest: window opens, value changes, toggle states, DOM mutations.
+    Much lighter than re-reading the full screen (~50 tokens vs ~5000).
 
-    Each event has: id, timestamp, event_type, element_name, element_role,
-    detail, new_value, consumed.
-
-    By default, marks returned events as consumed so they won't appear again.
-    Use mark_consumed=False to peek without consuming.
-
-    This is the delta-based perception tool — ~50 tokens vs ~5000 for full tree.
-    Use ds_events() between actions to see what changed.
+    NOTE: Only works for native apps (UIA). Not available in browser/CDP mode.
 
     Args:
         app: Optional app name. If omitted, uses the currently snapped app.
-        mark_consumed: If True (default), mark events as consumed after reading.
+        mark_consumed: If True (default), events won't appear again on next call.
     """
     db_path = _get_db_path(app)
     conn = sqlite3.connect(str(db_path))
@@ -561,169 +1057,160 @@ def ds_events(app: Optional[str] = None, mark_consumed: bool = True) -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def ds_click(element_name: str, app: Optional[str] = None) -> dict:
-    """Click a named UI element.
+def ds_click(element_name: str, prev_ok: str, app: Optional[str] = None) -> str:
+    """Click a UI element by its exact name. Works in both browser (CDP) and native (UIA) mode.
 
-    DirectShell finds the element by name in the accessibility tree,
-    calculates its center point, and sends a native mouse click.
-    The click is indistinguishable from physical hardware input.
+    The element name must match exactly as shown in ds_update_view() or ds_state().
 
     Args:
-        element_name: The exact name of the element to click (as shown in ds_state).
-        app: Optional app name. If omitted, uses the currently snapped app.
-
-    Returns:
-        Confirmation with the action ID.
+        element_name: The exact element name (e.g., "Submit", "Neuer Chat").
+        app: Optional app name (UIA mode only).
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
-    action_id = _inject_action("click", target=element_name, app=app)
-    return {"action": "click", "target": element_name, "id": action_id, "status": "queued", "learn": _learning_hint()}
+    if _is_cdp_available():
+        _cdp_click(element_name)
+        r = f"ok cdp{_learning_hint()}"
+    else:
+        action_id = _inject_action("click", target=element_name, app=app)
+        r = f"ok #{action_id}{_learning_hint()}"
+    _log_action("ds_click", {"element_name": element_name}, r, prev_ok)
+    return r
 
 
 @mcp.tool()
-def ds_text(value: str, target: str, app: Optional[str] = None) -> dict:
-    """Set text in a named input field instantly via UIA ValuePattern.
+def ds_text(value: str, target: str, prev_ok: str, app: Optional[str] = None) -> str:
+    """Set text in a named input field. PREFERRED over ds_type — instant and reliable.
 
-    This is the fast path — sets the entire string at once.
-    Use this for form fields, address bars, search boxes.
-
-    If the field doesn't support ValuePattern, DirectShell automatically
-    falls back to character-by-character keyboard input.
+    First focuses the target field, then types the text via simulated keyboard events.
+    In browser mode: uses CDP Input.dispatchKeyEvent (real keyboard simulation).
+    In native mode: uses UIA ValuePattern (instant set, no character-by-character typing).
 
     Args:
-        value: The text to set.
-        target: The name of the target input field (as shown in ds_state).
-        app: Optional app name. If omitted, uses the currently snapped app.
-
-    Returns:
-        Confirmation with the action ID.
+        value: The text to insert (e.g., "Hello world").
+        target: Exact name of the input field from ds_update_view() (e.g., "Search", "Message").
+        app: Optional app name (UIA mode only).
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
-    action_id = _inject_action("text", text=value, target=target, app=app)
-    return {"action": "text", "value": value, "target": target, "id": action_id, "status": "queued"}
+    if _is_cdp_available():
+        _cdp_type(value, target)
+        r = f"ok cdp{_learning_hint()}"
+    else:
+        action_id = _inject_action("text", text=value, target=target, app=app)
+        r = f"ok #{action_id}{_learning_hint()}"
+    _log_action("ds_text", {"value": value, "target": target}, r, prev_ok)
+    return r
 
 
 @mcp.tool()
-def ds_type(text: str, app: Optional[str] = None) -> dict:
-    """Type text character-by-character via raw keyboard simulation.
+def ds_type(text: str, prev_ok: str, app: Optional[str] = None) -> str:
+    """Type text into the currently focused element. Use ds_text() instead when possible.
 
-    Sends each character as a physical keystroke with 5ms delay.
-    Types into whatever currently has keyboard focus.
-
-    Use this for chat inputs, terminals, and fields that reject
-    programmatic text setting. Supports \\t for Tab and \\n for Enter.
+    Only use ds_type when ds_text doesn't work (Discord chat, terminals, canvas apps).
+    Types into whatever currently has keyboard focus — no target parameter.
+    Use \\t for Tab, \\n for Enter within the text.
 
     Args:
-        text: The text to type. Use \\t for Tab, \\n for Enter.
-        app: Optional app name. If omitted, uses the currently snapped app.
-
-    Returns:
-        Confirmation with the action ID.
+        text: The text to type (e.g., "hello\\n" to type hello and press Enter).
+        app: Optional app name (UIA mode only).
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
-    # Convert escape sequences to actual control chars (MCP sends literal \\t \\n)
+    _log_action("ds_type", {"text": text}, "", prev_ok)
     text = text.replace("\\t", "\t").replace("\\n", "\n").replace("\\r", "\r")
+    if _is_cdp_available():
+        _cdp_type(text)
+        return f"ok cdp{_learning_hint()}"
     action_id = _inject_action("type", text=text, app=app)
-    return {"action": "type", "text": text, "id": action_id, "status": "queued", "learn": _learning_hint()}
+    return f"ok #{action_id}{_learning_hint()}"
 
 
 @mcp.tool()
-def ds_key(combo: str, app: Optional[str] = None) -> dict:
-    """Press a keyboard shortcut or key combination.
+def ds_key(combo: str, prev_ok: str, app: Optional[str] = None) -> str:
+    """Press a keyboard shortcut. Works in both browser (CDP) and native (UIA) mode.
 
-    Supports modifiers (ctrl, alt, shift, win) combined with any key.
-
-    Examples:
-        "ctrl+s"         — Save
-        "ctrl+shift+s"   — Save As
-        "enter"          — Press Enter
-        "tab"            — Press Tab
-        "alt+f4"         — Close window
-        "ctrl+a"         — Select All
-        "f5"             — Refresh
-        "escape"         — Cancel
-        "pagedown"       — Scroll exactly one viewport down (use this for page navigation!)
-        "pageup"         — Scroll exactly one viewport up
-        "home"           — Jump to top of page
-        "end"            — Jump to bottom of page
+    Common combos: "enter", "tab", "escape", "pagedown", "pageup",
+    "ctrl+a", "ctrl+c", "ctrl+v", "ctrl+s", "alt+arrowleft" (back), "f5" (refresh).
 
     Args:
-        combo: Key combination string (e.g., "ctrl+shift+s").
-        app: Optional app name. If omitted, uses the currently snapped app.
-
-    Returns:
-        Confirmation with the action ID.
+        combo: Key combination (e.g., "ctrl+shift+s"). Modifiers: ctrl, alt, shift.
+        app: Optional app name (UIA mode only).
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
-    action_id = _inject_action("key", text=combo, app=app)
-    return {"action": "key", "combo": combo, "id": action_id, "status": "queued", "learn": _learning_hint()}
+    if _is_cdp_available():
+        _cdp_key(combo)
+        r = f"ok cdp{_learning_hint()}"
+    else:
+        action_id = _inject_action("key", text=combo, app=app)
+        r = f"ok #{action_id}{_learning_hint()}"
+    _log_action("ds_key", {"combo": combo}, r, prev_ok)
+    return r
 
 
 @mcp.tool()
-def ds_scroll(direction: str, amount: int = 1, app: Optional[str] = None) -> dict:
-    """Scroll in the target application.
+def ds_scroll(direction: str, prev_ok: str, amount: int = 1, app: Optional[str] = None) -> str:
+    """Scroll the page. Works in both browser (CDP) and native (UIA) mode.
 
-    For page-by-page navigation, prefer ds_key("pagedown") / ds_key("pageup")
-    which moves exactly one viewport height. Use ds_scroll only for fine-grained
-    mouse wheel scrolling (e.g., scrolling inside a specific panel).
+    Each notch scrolls ~3 lines. Use ds_update_view() after scrolling to see new content.
 
     Args:
-        direction: One of "up", "down", "left", "right".
-        amount: Number of scroll notches (default 1). Each notch ~3 lines.
-        app: Optional app name. If omitted, uses the currently snapped app.
-
-    Returns:
-        Confirmation with the action ID.
+        direction: "up", "down", "left", or "right".
+        amount: Number of scroll notches (default 1, use 3-5 for a full page).
+        app: Optional app name (UIA mode only).
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
     if direction not in ("up", "down", "left", "right"):
         raise ValueError(f"Invalid direction: {direction}. Use up/down/left/right.")
-    # Only wait on the last scroll action
-    ids = []
-    for i in range(amount):
-        is_last = (i == amount - 1)
-        ids.append(_inject_action("scroll", text=direction, app=app, wait=is_last))
-    return {"action": "scroll", "direction": direction, "amount": amount, "ids": ids, "status": "queued"}
+    if _is_cdp_available():
+        _cdp_scroll(direction, amount)
+        r = f"ok cdp{_learning_hint()}"
+    else:
+        ids = []
+        for i in range(amount):
+            is_last = (i == amount - 1)
+            ids.append(_inject_action("scroll", text=direction, app=app, wait=is_last))
+        r = f"ok #{ids[-1]}"
+    _log_action("ds_scroll", {"direction": direction, "amount": amount}, r, prev_ok)
+    return r
 
 
 @mcp.tool()
-def ds_batch(actions: list[dict], app: Optional[str] = None) -> list[dict]:
-    """Execute multiple actions in sequence.
+def ds_batch(actions: list[dict], prev_ok: str, app: Optional[str] = None) -> str:
+    """Execute multiple actions in sequence. Works in both browser (CDP) and native (UIA) mode.
 
-    Each action is a dict with 'action' (required), 'text', and 'target' fields.
-    Actions are inserted into the queue in order and executed at 33 Hz.
+    Use this to chain clicks, text input, and key presses without round-trips.
 
-    Example:
-        [
-            {"action": "click", "target": "Amount"},
-            {"action": "text", "text": "2599.00", "target": "Amount"},
-            {"action": "key", "text": "tab"},
-            {"action": "text", "text": "19%", "target": "Tax Rate"},
-            {"action": "click", "target": "Save"}
-        ]
+    Each action dict needs: "action" (click/text/key), plus "target" and/or "text".
+    Example: [{"action": "click", "target": "Email"}, {"action": "text", "text": "hi@test.com", "target": "Email"}, {"action": "key", "text": "tab"}]
 
     Args:
-        actions: List of action dicts. Each needs at minimum an 'action' field.
-        app: Optional app name. If omitted, uses the currently snapped app.
-
-    Returns:
-        List of confirmations with action IDs.
+        actions: List of action dicts. Each needs "action" (click/text/key) at minimum.
+        app: Optional app name (UIA mode only).
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
-    results = []
-    total = len(actions)
-    for i, act in enumerate(actions):
-        is_last = (i == total - 1)
-        action_id = _inject_action(
-            action=act.get("action", "text"),
-            text=act.get("text", ""),
-            target=act.get("target", ""),
-            app=app,
-            wait=is_last,  # only wait for the last action
-        )
-        results.append({
-            "action": act.get("action"),
-            "id": action_id,
-            "status": "queued",
-        })
-    hint = _learning_hint()
-    if results and hint:
-        results[-1]["learn"] = hint
-    return results
+    if _is_cdp_available():
+        for act in actions:
+            a = act.get("action", "click")
+            if a == "click":
+                _cdp_click(act.get("target", ""))
+            elif a in ("type", "text"):
+                _cdp_type(act.get("text", ""), act.get("target", ""))
+            elif a == "key":
+                _cdp_key(act.get("text", ""))
+        r = f"ok {len(actions)} actions cdp{_learning_hint()}"
+    else:
+        total = len(actions)
+        last_id = 0
+        for i, act in enumerate(actions):
+            is_last = (i == total - 1)
+            last_id = _inject_action(
+                action=act.get("action", "text"),
+                text=act.get("text", ""),
+                target=act.get("target", ""),
+                app=app,
+                wait=is_last,
+            )
+        r = f"ok {total} actions, last #{last_id}{_learning_hint()}"
+    _log_action("ds_batch", {"actions": actions}, r, prev_ok)
+    return r
 
 
 # ---------------------------------------------------------------------------
@@ -731,11 +1218,14 @@ def ds_batch(actions: list[dict], app: Optional[str] = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def ds_profile_list() -> dict:
+def ds_profile_list(prev_ok: str) -> dict:
     """List all known application profiles and previously snapped apps.
 
     Shows which apps have been seen before and which have
     learned profiles with semantic element mappings.
+
+    Args:
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
     # Known apps from .db files
     known_apps = sorted(set(p.stem for p in PROFILES_DIR.glob("*.db")))
@@ -761,6 +1251,7 @@ def ds_profile_save(
     app: str,
     description: str,
     elements: dict[str, str],
+    prev_ok: str,
 ) -> dict:
     """Save a semantic profile for an application.
 
@@ -802,7 +1293,7 @@ def ds_profile_save(
 
 
 @mcp.tool()
-def ds_profile_get(app: str) -> dict:
+def ds_profile_get(app: str, prev_ok: str) -> dict:
     """Get the saved profile for an application.
 
     Returns the semantic element mapping if one has been saved.
@@ -843,347 +1334,217 @@ One line per value. Plain text. If nothing interesting, write: none"""
 
 # In-memory store for active tools
 _active_view = {"screen": "", "tools": [], "data": "", "raw_tools": []}
+_cdp_labels: set = set()  # CDP element labels from last update_view
 
 
 def _get_openrouter_key() -> str:
-    """Load OpenRouter API key. Checks: env var → .env next to server.py → repo root .env"""
-    import os
-    key = os.environ.get("OPENROUTER_API_KEY")
-    if key:
-        return key
-    # Search for .env files
-    for candidate in [
-        Path(__file__).resolve().parent / ".env",         # ds-mcp/.env
-        Path(__file__).resolve().parent.parent / ".env",   # repo root/.env
-    ]:
-        if candidate.exists():
-            with open(candidate, "r") as f:
-                for line in f:
-                    if line.startswith("OPENROUTER_API_KEY="):
-                        return line.strip().split("=", 1)[1]
-    raise RuntimeError(
-        "OPENROUTER_API_KEY not found. Set it as an environment variable or create a .env file "
-        "with OPENROUTER_API_KEY=your_key_here. Get a key at https://openrouter.ai/keys"
-    )
+    """Load OpenRouter API key from .env file."""
+    env_path = Path(__file__).resolve().parent.parent.parent.parent / "new-server" / ".env"
+    if not env_path.exists():
+        # Try common locations
+        for p in [
+            Path(r"C:\Users\hacka\Desktop\Neuer-Main-Server\new-server\.env"),
+        ]:
+            if p.exists():
+                env_path = p
+                break
+    with open(env_path, "r") as f:
+        for line in f:
+            if line.startswith("OPENROUTER_API_KEY="):
+                return line.strip().split("=", 1)[1]
+    raise RuntimeError("OPENROUTER_API_KEY not found")
 
 
-def _get_cdp_elements() -> str:
-    """Extract interactive elements from the active browser tab via CDP (port 9222).
-    Returns a compact text listing of inputs, buttons, links, etc. or empty string if CDP unavailable."""
-    try:
-        # Quick check if CDP is up
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.3)
-        result = s.connect_ex(("127.0.0.1", 9222))
-        s.close()
-        if result != 0:
-            return ""
-
-        # Get active tab (first visible page)
-        tabs = requests.get("http://127.0.0.1:9222/json/list", timeout=2).json()
-        page_tab = None
-        for t in tabs:
-            if t.get("type") == "page" and "webSocketDebuggerUrl" in t:
-                page_tab = t
-                break  # First page tab = active
-        if not page_tab:
-            return ""
-
-        ws_url = page_tab["webSocketDebuggerUrl"]
-        tab_title = page_tab.get("title", "")
-        tab_url = page_tab.get("url", "")
-
-        # Sync websocket via raw socket (no async dependency needed)
-        import websocket  # websocket-client (sync)
-        ws = websocket.create_connection(ws_url, timeout=5)
-
-        js = r'''(() => {
-            const results = [];
-            const seen = new Set();
-            const selectors = 'input, textarea, select, button, [role="button"], [role="textbox"], [role="menuitem"], [role="link"], [role="checkbox"], [role="radio"], [role="combobox"], [role="searchbox"], [role="tab"], [role="gridcell"], [contenteditable="true"], a[href]';
-            document.querySelectorAll(selectors).forEach(el => {
-                if (el.offsetParent === null && el.type !== 'hidden') return; // skip invisible
-                const tag = el.tagName.toLowerCase();
-                const role = el.getAttribute('role') || '';
-                const ariaLabel = el.getAttribute('aria-label') || '';
-                const name = el.getAttribute('name') || '';
-                const id = el.id || '';
-                const type = el.type || '';
-                const placeholder = el.placeholder || '';
-                const text = (el.textContent || '').trim().substring(0, 60);
-                const label = ariaLabel || placeholder || text || name || id;
-                const key = `${tag}|${role}|${label}`;
-                if (seen.has(key) || !label) return;
-                seen.add(key);
-                let action = 'click';
-                if (['input','textarea'].includes(tag) || role === 'textbox' || role === 'searchbox' || role === 'combobox' || el.contentEditable === 'true') action = 'type';
-                if (tag === 'select') action = 'select';
-                results.push(`${action}|${label}`);
-            });
-            return results.slice(0, 80).join('\n');
-        })()'''
-
-        ws.send(json.dumps({
-            "id": 1,
-            "method": "Runtime.evaluate",
-            "params": {"expression": js, "returnByValue": True}
-        }))
-        resp = json.loads(ws.recv())
-        ws.close()
-
-        value = resp.get("result", {}).get("result", {}).get("value", "")
-        if not value:
-            return ""
-
-        return f"[CDP: {tab_title} — {tab_url}]\n{value}"
-    except Exception:
-        return ""
+# OLD: _get_cdp_elements() and _execute_cdp_action() removed — superseded by _cdp_click/_cdp_type
 
 
-def _filter_a11y(raw: str) -> str:
-    """Extract ONLY readable text content from a11y — no coordinates, no chrome."""
-    lines = []
-    in_content = False
-    for line in raw.splitlines():
-        # Keep header (window title)
-        if line.startswith("# Window:"):
-            lines.append(line)
-            continue
-        # Keep Focus section (1 line)
-        if line.startswith("## Focus"):
-            in_content = False
-            continue
-        if line.startswith("[interact]"):
-            lines.append(f"Focus: {line.split('\"')[1] if '\"' in line else line}")
-            continue
-        # Keep Input Targets — only name + value, strip coords
-        if line.startswith("## Input Targets"):
-            in_content = True
-            continue
-        if in_content and line.startswith("["):
-            # Extract label from quotes
-            if '"' in line:
-                label = line.split('"')[1]
-                if label in ("Laden…", "Laden..."):
-                    continue  # skip loading placeholders
-                lines.append(f"  input: {label}")
-            continue
-        if in_content and line.strip().startswith("value:"):
-            lines.append(f"    {line.strip()}")
-            continue
-        # Content section — keep all text
-        if line.startswith("## Content"):
-            in_content = False
-            lines.append("## Content")
-            continue
-        if line.startswith("##"):
-            in_content = False
-            continue
-        # Everything after ## Content is pure text
-        if lines and lines[-1] == "## Content" or (lines and not line.startswith("[") and not line.startswith("  ") and line.strip()):
-            if line.strip() and not line.startswith("#"):
-                lines.append(line.strip())
-    return "\n".join(lines)
+# OLD: _filter_a11y, _filter_snap, _call_translator, _parse_translator_response
+# removed — only used by Gemini translator path which is now disabled.
+# Gemini translator code preserved in ds_update_view() comments below.
 
 
-def _filter_snap(raw: str) -> str:
-    """Extract ONLY page-relevant operable elements — no browser chrome."""
-    # Browser chrome patterns to skip
-    skip_patterns = (
-        "Laden…", "Laden...", "Tab schließen", "Tabs suchen",
-        "Minimieren", "Maximieren", "Wiederherstellen", "Schließen",
-        "Opera-Menü", "GX Corner", "Zum Ausklappen",
-        "Pinboards", "Momentaufnahme", "An Mein Flow",
-        "Zu Lesezeichen", "Erweiterungen", "Opera Account",
-        "Downloads", "Frage AI", "Einfache Einrichtung",
-        "GX Cleaner", "GX Control", "Shaders", "Mods",
-        "Twitch", "WhatsApp", "Player", "Verlauf",
-        "Einstellungen", "Einrichtung der Seitenleiste",
-        "Neuer Tab", "Adressleiste", "Menü „Erweiterungen"",
-        "uBlock", "Zurück", "Stopp", "Vor",
-        "Seite mit „Geschützt"", "Zoomanzeige",
-    )
-    # Tab patterns: known browser tabs (Gmail, YouTube, etc.)
-    tab_skip = (" - Gmail", "- YouTube", "| YouTube", "Hacker News",
-                "DEV Community", "Stack Overflow", "Reddit",
-                "Wikipedia", "Google Docs", "Google Drive")
+def _cdp_extract() -> dict:
+    """Deterministic CDP extraction — viewport-visible tools + page text. No LLM."""
+    ws = _cdp_ws()
 
-    lines = []
-    for line in raw.splitlines():
-        if line.startswith("#"):
-            if line.startswith("# Window:"):
-                lines.append(line)
-            continue
-        stripped = line.strip()
-        if not stripped:
-            continue
-        # Extract element name
-        name = ""
-        if '"' in stripped:
-            parts = stripped.split('"')
-            if len(parts) >= 2:
-                name = parts[1]
-        if not name:
-            continue
-        # Skip browser chrome
-        if any(p in name for p in skip_patterns):
-            continue
-        # Skip browser tabs (other open pages)
-        if any(p in name for p in tab_skip):
-            continue
-        # Skip "Laden…" keyboard entries
-        if name == "Laden…":
-            continue
-        lines.append(stripped)
-    return "\n".join(lines)
+    js = r'''(() => {
+        const vw = window.innerWidth, vh = window.innerHeight;
+        const tools = [], seen = new Set();
+        document.querySelectorAll('__SELECTORS__').forEach(el => {
+            const r = el.getBoundingClientRect();
+            if (!r.width || !r.height || r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) return;
+            const s = getComputedStyle(el);
+            if (s.opacity === '0' || s.visibility === 'hidden' || s.pointerEvents === 'none') return;
+            const label = el.getAttribute('aria-label') || el.placeholder || (el.textContent||'').trim().substring(0,60) || el.name || el.id;
+            if (!label || seen.has(label)) return;
+            seen.add(label);
+            const tag = el.tagName.toLowerCase();
+            const role = el.getAttribute('role') || '';
+            let action = 'click';
+            if (['input','textarea'].includes(tag) || ['textbox','searchbox','combobox'].includes(role) || el.contentEditable==='true') action = 'type';
+            if (tag === 'select') action = 'select';
+            tools.push(action + '|' + label);
+        });
+        // Viewport-only text: only LEAF block elements (no block children = no duplication)
+        const blockTags = new Set(['P','H1','H2','H3','H4','H5','H6','LI','TD','TH','DT','DD','PRE','BLOCKQUOTE','FIGCAPTION','ARTICLE','SECTION','HEADER','FOOTER','MAIN','ASIDE','NAV','DIV','SPAN','A','LABEL']);
+        const blocks = document.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,td,th,dt,dd,pre,blockquote,figcaption,label,span,div,a,article,section');
+        const textParts = [], textSeen = new Set();
+        for (const el of blocks) {
+            const r = el.getBoundingClientRect();
+            if (!r.height || r.bottom < 0 || r.top > vh) continue;
+            if (r.height > vh * 1.5) continue;
+            const s = getComputedStyle(el);
+            if (s.opacity === '0' || s.visibility === 'hidden' || s.display === 'none') continue;
+            // Skip if has block-level children in viewport (let children handle text)
+            let hasBlockChild = false;
+            for (const child of el.children) {
+                if (blockTags.has(child.tagName) && child.getBoundingClientRect().height > 0) {
+                    const cs = getComputedStyle(child);
+                    if (cs.display !== 'inline' && cs.display !== 'inline-block') { hasBlockChild = true; break; }
+                }
+            }
+            if (hasBlockChild) continue;
+            const t = el.innerText?.trim();
+            if (!t || t.length < 2 || textSeen.has(t)) continue;
+            textSeen.add(t);
+            textParts.push(t);
+        }
+        const text = textParts.join('\n');
+        return JSON.stringify({tools: tools, text: text});
+    })()'''.replace('__SELECTORS__', _INTERACTIVE_SELECTORS)
 
+    ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": js, "returnByValue": True}}))
+    data = json.loads(json.loads(ws.recv())["result"]["result"]["value"])
+    ws.close()
 
-def _call_translator(a11y: str, snap: str) -> str:
-    """Send a11y files (+ optional CDP data) to Gemini and get translated view."""
-    key = _get_openrouter_key()
-
-    # Pre-filter: send only what Gemini needs
-    filtered_a11y = _filter_a11y(a11y)
-    filtered_snap = _filter_snap(snap)
-
-    prompt = _TRANSLATOR_PROMPT + f"\n\n--- SCREEN CONTENT (.a11y) ---\n\n{filtered_a11y}\n\n--- OPERABLE ELEMENTS (.a11y.snap) ---\n\n{filtered_snap}"
-
-    # Enrich with CDP DOM elements if browser is running with DevTools
-    cdp_data = _get_cdp_elements()
-    if cdp_data:
-        prompt += f"\n\n--- CDP DOM ELEMENTS (browser page) ---\n\n{cdp_data}"
-
-    resp = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={
-            "model": _TRANSLATOR_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 2000,
-            "temperature": 0.1,
-        },
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text[:200]}")
-    return resp.json()["choices"][0]["message"]["content"]
-
-
-def _parse_translator_response(text: str) -> dict:
-    """Parse the translator's plain text response into structured data."""
-    sections = re.split(r'\n---\n', text, maxsplit=2)
-
-    screen = sections[0].strip() if len(sections) > 0 else ""
-    # Remove "SCREEN" header if present
-    screen = re.sub(r'^SCREEN\s*\n', '', screen).strip()
-
-    tools_raw = sections[1].strip() if len(sections) > 1 else ""
-    tools_raw = re.sub(r'^TOOLS\s*\n', '', tools_raw).strip()
-
-    data = sections[2].strip() if len(sections) > 2 else ""
-    data = re.sub(r'^DATA\s*\n', '', data).strip()
-
-    # Parse tools: action|"element_name"|description
     tools = []
-    for line in tools_raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        parts = line.split('|', 2)
-        if len(parts) >= 3:
-            action = parts[0].strip()
-            element = parts[1].strip().strip('"')
-            desc = parts[2].strip()
-            tools.append({"action": action, "element": element, "description": desc})
+    for line in data["tools"]:
+        parts = line.split("|", 1)
+        if len(parts) == 2:
+            tools.append({"action": parts[0], "element": parts[1], "description": ""})
 
-    return {"screen": screen, "tools": tools, "data": data}
+    return {"tools": tools, "text": data["text"].strip(), "title": ""}
 
 
 @mcp.tool()
-def ds_update_view(app: Optional[str] = None) -> dict:
-    """Update the agent's understanding of the current screen.
+def ds_update_view(prev_ok: str, app: Optional[str] = None) -> str:
+    """PRIMARY TOOL — Read what's on screen and get available actions.
 
-    Reads the accessibility tree and operable elements, sends them to
-    a fast LLM (Gemini Flash Lite) which translates them into:
+    Returns TWO sections separated by '---':
+    1. VISIBLE TEXT — only what a human can see in the viewport right now
+    2. NUMBERED TOOLS — clickable/typeable elements, e.g. [1] click|Submit, [2] type|Search
 
-    1. SCREEN — What a human would see right now (2-3 sentences)
-    2. TOOLS — Every actionable element with human-readable descriptions
-    3. DATA — Interesting values visible on the page
+    Use ds_act(N) to execute tool N from the list. For type tools, pass text: ds_act(2, text="query").
 
-    Call this after navigating to a new page or when you need to
-    understand what's on screen. The returned tools show you exactly
-    what you can do and which element names to use.
+    Works in both browser (CDP) and native (UIA) mode automatically.
+    Call this FIRST in any workflow, and AFTER every action to see the result.
 
     Args:
-        app: Optional app name. If omitted, uses the currently snapped app.
-
-    Returns:
-        screen: Human description of what's visible
-        tools: List of available actions with element names and descriptions
-        data: Extracted values from the page
+        app: Optional app name (UIA mode only).
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
-    global _active_view
+    _log_action("ds_update_view", {}, "", prev_ok)
+    global _active_view, _cdp_labels
 
+    # --- Deterministic CDP path (no LLM) ---
+    try:
+        cdp = _cdp_extract()
+    except Exception:
+        cdp = None
+
+    if cdp and cdp["tools"]:
+        _active_view = {"screen": cdp["text"], "tools": cdp["tools"], "data": ""}
+        _cdp_labels = {t["element"] for t in cdp["tools"]}
+
+        tool_lines = []
+        for i, t in enumerate(cdp["tools"], 1):
+            tool_lines.append(f"[{i}] {t['action']}|{t['element']}")
+
+        result = cdp["text"] + "\n---\n" + "\n".join(tool_lines)
+        return _with_chars(result)
+
+    # --- Fallback: UIA a11y (native apps without CDP) ---
     a11y = _read_file(".a11y", app)
     snap = _read_file(".a11y.snap", app)
 
-    raw_response = _call_translator(a11y, snap)
-    parsed = _parse_translator_response(raw_response)
+    # Parse snap elements directly (deterministic, no LLM)
+    tools = []
+    for line in snap.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if '"' in line:
+            name = line.split('"')[1]
+            action = "type" if line.startswith("[keyboard]") else "click"
+            tools.append({"action": action, "element": name, "description": ""})
 
-    _active_view = {
-        "screen": parsed["screen"],
-        "tools": parsed["tools"],
-        "data": parsed["data"],
-    }
+    _active_view = {"screen": a11y, "tools": tools, "data": ""}
+    _cdp_labels = set()
 
-    # Format tools for display
     tool_lines = []
-    for i, t in enumerate(parsed["tools"], 1):
-        tool_lines.append(f"  [{i}] {t['action']}|{t['element']}| {t['description']}")
+    for i, t in enumerate(tools, 1):
+        tool_lines.append(f"[{i}] {t['action']}|{t['element']}")
 
-    # Find available learnings for this app
-    app_name = app or _get_snapped_app()
-    learnings_dir = PROFILES_DIR / "learnings"
-    available_learnings = []
-    if learnings_dir.is_dir() and app_name:
-        prefix = app_name.lower() + "_"
-        for f in sorted(learnings_dir.glob(f"{prefix}*.md")):
-            context = f.stem[len(prefix):]  # e.g. "sheets" from "opera_sheets.md"
-            available_learnings.append(context)
+    # Extract text content from a11y
+    content = ""
+    in_content = False
+    for line in a11y.splitlines():
+        if line.startswith("## Content"):
+            in_content = True
+            continue
+        if in_content and line.startswith("##"):
+            break
+        if in_content and line.strip():
+            content += line.strip() + "\n"
 
-    result = {
-        "screen": parsed["screen"],
-        "tools": "\n".join(tool_lines),
-        "tool_count": len(parsed["tools"]),
-        "data": parsed["data"],
-    }
-    if available_learnings:
-        result["learnings"] = available_learnings
-        result["learnings_hint"] = f"Read learnings BEFORE acting: ds_learn('{app_name}', '<context>')"
-    else:
-        result["learnings"] = []
-        result["learnings_hint"] = (
-            f"No learnings yet for '{app_name}'. After completing actions, "
-            f"save what you learned: ds_learn('{app_name}', '<context>', append='your insight here')"
-        )
+    result = (content.strip() or "(no text)") + "\n---\n" + "\n".join(tool_lines)
+    return _with_chars(result)
 
-    return result
+
+    # --- OLD: Gemini translator path (kept for reference) ---
+    # raw_response = _call_translator(a11y, snap)
+    # parsed = _parse_translator_response(raw_response)
+    # _active_view = {"screen": parsed["screen"], "tools": parsed["tools"], "data": parsed["data"]}
+    # tool_lines = []
+    # for i, t in enumerate(parsed["tools"], 1):
+    #     tool_lines.append(f"  [{i}] {t['action']}|{t['element']}| {t['description']}")
+    # app_name = app or _get_snapped_app()
+    # learnings_dir = PROFILES_DIR / "learnings"
+    # available_learnings = []
+    # if learnings_dir.is_dir() and app_name:
+    #     prefix = app_name.lower() + "_"
+    #     for f in sorted(learnings_dir.glob(f"{prefix}*.md")):
+    #         context = f.stem[len(prefix):]
+    #         available_learnings.append(context)
+    # result = {
+    #     "screen": parsed["screen"],
+    #     "tools": "\n".join(tool_lines),
+    #     "tool_count": len(parsed["tools"]),
+    #     "data": parsed["data"],
+    # }
+    # if available_learnings:
+    #     result["learnings"] = available_learnings
+    #     result["learnings_hint"] = f"Read learnings BEFORE acting: ds_learn('{app_name}', '<context>')"
+    # else:
+    #     result["learnings"] = []
+    #     result["learnings_hint"] = (
+    #         f"No learnings yet for '{app_name}'. After completing actions, "
+    #         f"save what you learned: ds_learn('{app_name}', '<context>', append='your insight here')"
+    #     )
+    # return result
 
 
 @mcp.tool()
-def ds_learn(app: str, context: str, append: Optional[str] = None) -> dict:
-    """Read or append to a learning file for a specific app+context.
+def ds_learn(app: str, context: str, prev_ok: str, append: Optional[str] = None) -> dict:
+    """Read or save tips/quirks for an app. Persists across sessions.
 
-    Learning files store tips, quirks, and best practices discovered while
-    using an application. They persist across sessions and make you smarter.
+    Save what you learn about an app (e.g., "Discord: must use ds_type for chat, ds_text doesn't work").
+    Read before interacting with an app to recall past learnings.
 
     Args:
-        app: Application name (e.g. "opera", "notepad", "discord")
-        context: Action context (e.g. "sheets", "gmail", "general")
-        append: If provided, append this text to the learning file. If omitted, read it.
-
-    Returns:
-        content: The learning file contents (after read or append)
+        app: Application name (e.g., "opera", "discord", "chatgpt").
+        context: Topic (e.g., "general", "input", "navigation").
+        append: Text to save. Omit to read existing learnings.
     """
     learnings_dir = PROFILES_DIR / "learnings"
     learnings_dir.mkdir(parents=True, exist_ok=True)
@@ -1202,20 +1563,19 @@ def ds_learn(app: str, context: str, append: Optional[str] = None) -> dict:
 
 
 @mcp.tool()
-def ds_act(tool_number: int, text: Optional[str] = None, app: Optional[str] = None) -> dict:
-    """Execute an action from the current tool list.
+def ds_act(tool_number: int, prev_ok: str, text: Optional[str] = None, app: Optional[str] = None) -> str:
+    """Execute a numbered tool from ds_update_view() output.
 
-    After calling ds_update_view(), use the tool number to execute an action.
-    For 'type' actions, provide the text parameter.
-    For 'click' actions, just the tool number is enough.
+    ds_update_view() returns tools like: [1] click|Submit  [2] type|Search
+    Call ds_act(1) to click Submit, or ds_act(2, text="query") to type in Search.
+
+    IMPORTANT: Always call ds_update_view() first — ds_act only works with the latest tool list.
 
     Args:
-        tool_number: The tool number from ds_update_view output (1-based).
-        text: Text to type (required for 'type' actions, ignored for 'click').
-        app: Optional app name. If omitted, uses the currently snapped app.
-
-    Returns:
-        Confirmation with action details.
+        tool_number: The tool number (1-based) from ds_update_view output.
+        text: Text to type (required when the tool is a 'type' action, ignored for 'click').
+        app: Optional app name (UIA mode only).
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
     if not _active_view["tools"]:
         raise ValueError("No active tools. Call ds_update_view() first.")
@@ -1225,19 +1585,27 @@ def ds_act(tool_number: int, text: Optional[str] = None, app: Optional[str] = No
         raise ValueError(f"Tool {tool_number} not found. Available: 1-{len(_active_view['tools'])}")
 
     tool = _active_view["tools"][idx]
+    element = tool["element"]
+    action_type = tool["action"]
 
-    if tool["action"] == "type":
+    if action_type == "type":
         if not text:
             raise ValueError(f"Tool {tool_number} is a type action — provide text parameter.")
-        action_id = _inject_action("type", text=text, target=tool["element"], app=app)
-        return {"action": "type", "element": tool["element"], "text": text, "id": action_id, "description": tool["description"]}
-    elif tool["action"] == "click":
-        action_id = _inject_action("click", target=tool["element"], app=app)
-        return {"action": "click", "element": tool["element"], "id": action_id, "description": tool["description"]}
+        if _is_cdp_available():
+            _cdp_type(text, element)
+            r = f"ok cdp{_learning_hint()}"
+        else:
+            action_id = _inject_action("type", text=text, target=element, app=app)
+            r = f"ok #{action_id}{_learning_hint()}"
     else:
-        # Fallback — treat as click
-        action_id = _inject_action("click", target=tool["element"], app=app)
-        return {"action": tool["action"], "element": tool["element"], "id": action_id, "description": tool["description"]}
+        if _is_cdp_available():
+            _cdp_click(element)
+            r = f"ok cdp{_learning_hint()}"
+        else:
+            action_id = _inject_action("click", target=element, app=app)
+            r = f"ok #{action_id}{_learning_hint()}"
+    _log_action("ds_act", {"tool_number": tool_number, "element": element, "action": action_type, "text": text}, r, prev_ok)
+    return r
 
 
 # ---------------------------------------------------------------------------
