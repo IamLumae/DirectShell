@@ -184,7 +184,8 @@ def _db_query(sql: str, app: Optional[str] = None) -> list[dict]:
 
 
 # --- Shared CSS selector for interactive elements (used by extract, click, type) ---
-_INTERACTIVE_SELECTORS = 'input,textarea,select,button,[role="button"],[role="textbox"],[role="menuitem"],[role="link"],[role="checkbox"],[role="radio"],[role="combobox"],[role="searchbox"],[role="tab"],[role="option"],[role="listitem"],[role="treeitem"],[role="gridcell"],[role="switch"],[role="slider"],[contenteditable="true"],[tabindex],a[href]'
+# Note: tabindex catches many non-interactive elements; exclude tabindex=-1.
+_INTERACTIVE_SELECTORS = 'input,textarea,select,button,[role="button"],[role="textbox"],[role="menuitem"],[role="link"],[role="checkbox"],[role="radio"],[role="combobox"],[role="searchbox"],[role="tab"],[role="option"],[role="listitem"],[role="treeitem"],[role="gridcell"],[role="switch"],[role="slider"],[contenteditable="true"],[tabindex]:not([tabindex="-1"]),a[href]'
 
 # --- Shared JS for viewport-only text extraction (used by ds_update_view + ds_screen) ---
 _VIEWPORT_TEXT_JS = r'''(() => {
@@ -265,6 +266,7 @@ def _is_cdp_available() -> bool:
 
 
 _cdp_active_tab_id: Optional[str] = None  # Track which tab we're focused on
+_cdp_tool_map: dict[str, dict] = {}  # display label -> tool dict from last ds_update_view()
 
 def _cdp_tabs() -> list[dict]:
     """Get all CDP browser tabs."""
@@ -288,16 +290,142 @@ def _cdp_ws(tab_id: Optional[str] = None):
     return _ws.create_connection(page_tab["webSocketDebuggerUrl"], timeout=5)
 
 
+def _cdp_dispatch_click(ws, x: float, y: float, click_count: int = 1, msg_id_base: int = 2) -> None:
+    """Dispatch real mouse click at viewport coords (x, y)."""
+    for eid, method_type in [(msg_id_base, "mousePressed"), (msg_id_base + 1, "mouseReleased")]:
+        ws.send(json.dumps({"id": eid, "method": "Input.dispatchMouseEvent", "params": {
+            "type": method_type, "x": x, "y": y, "button": "left", "clickCount": click_count
+        }}))
+        ws.recv()
+
+
+def _cdp_eval(ws, js: str, msg_id: int = 1):
+    """Evaluate JS in the active page context and return the raw CDP response."""
+    ws.send(json.dumps({"id": msg_id, "method": "Runtime.evaluate", "params": {"expression": js, "returnByValue": True}}))
+    return json.loads(ws.recv())
+
+
+def _cdp_find_coords_for_tool(ws, tool: dict) -> Optional[dict]:
+    """Try to find the element for a tool dict and return {x,y} or None.
+
+    Prefers tool["dsid"] (data-ds-mcp attribute), then tool["selector"].
+    Falls back to tool["x"], tool["y"] when available.
+    """
+    dsid = tool.get("dsid") or ""
+    selector = tool.get("selector") or ""
+
+    # Find by stable DS id across document, open shadow roots, and same-origin iframes.
+    if dsid:
+        safe = dsid.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+        js = f"""(() => {{
+            const id = '{safe}';
+            const attr = 'data-ds-mcp';
+            const sel = `[${{attr}}="${{CSS.escape(id)}}" ]`.replace(' ]', ']');
+            const vw = window.innerWidth, vh = window.innerHeight;
+            function centerFor(el, offX, offY) {{
+                const r = el.getBoundingClientRect();
+                if (!r.width || !r.height) return null;
+                const x = offX + r.x + r.width/2;
+                const y = offY + r.y + r.height/2;
+                if (x < 0 || y < 0 || x > vw || y > vh) return null;
+                return {{x, y}};
+            }}
+            function findInRoot(root, offX, offY) {{
+                try {{
+                    const el = root.querySelector ? root.querySelector(sel) : null;
+                    if (el) return centerFor(el, offX, offY);
+                }} catch (_) {{}}
+                // Traverse to discover open shadow roots
+                try {{
+                    const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+                    while (tw.nextNode()) {{
+                        const node = tw.currentNode;
+                        if (node && node.shadowRoot) {{
+                            const c = findInRoot(node.shadowRoot, offX, offY);
+                            if (c) return c;
+                        }}
+                    }}
+                }} catch (_) {{}}
+                return null;
+            }}
+            // 1) main document
+            let c = findInRoot(document, 0, 0);
+            if (c) return JSON.stringify(c);
+            // 2) same-origin iframes (coords offset by iframe rect)
+            for (const iframe of document.querySelectorAll('iframe')) {{
+                try {{
+                    const idoc = iframe.contentDocument;
+                    if (!idoc) continue;
+                    const ir = iframe.getBoundingClientRect();
+                    c = findInRoot(idoc, ir.x, ir.y);
+                    if (c) return JSON.stringify(c);
+                }} catch (_) {{}}
+            }}
+            return 'not_found';
+        }})()"""
+        resp = _cdp_eval(ws, js, msg_id=1)
+        val = resp.get("result", {}).get("result", {}).get("value", "error")
+        if val and val not in ("not_found", "error"):
+            try:
+                return json.loads(val)
+            except Exception:
+                pass
+
+    # Find by selector in the top-level document only (selectors don't pierce shadow/iframe).
+    if selector:
+        safe = selector.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+        js = f"""(() => {{
+            const sel = '{safe}';
+            const el = document.querySelector(sel);
+            if (!el) return 'not_found';
+            const r = el.getBoundingClientRect();
+            if (!r.width || !r.height) return 'not_found';
+            return JSON.stringify({{x: r.x + r.width/2, y: r.y + r.height/2}});
+        }})()"""
+        resp = _cdp_eval(ws, js, msg_id=2)
+        val = resp.get("result", {}).get("result", {}).get("value", "error")
+        if val and val not in ("not_found", "error"):
+            try:
+                return json.loads(val)
+            except Exception:
+                pass
+
+    # Fallback: stored coords from extraction (best-effort).
+    if isinstance(tool.get("x"), (int, float)) and isinstance(tool.get("y"), (int, float)):
+        return {"x": float(tool["x"]), "y": float(tool["y"])}
+
+    return None
+
+
+def _cdp_click_tool(tool: dict) -> str:
+    """Click a DOM element using a tool dict (stable id/selector/coords)."""
+    ws = _cdp_ws()
+    coords = _cdp_find_coords_for_tool(ws, tool)
+    if not coords:
+        ws.close()
+        raise RuntimeError(f"CDP: '{tool.get('element', '?')}' not found")
+    _cdp_dispatch_click(ws, coords["x"], coords["y"], msg_id_base=10)
+    ws.close()
+    return "clicked"
+
+
 def _cdp_click(element_name: str) -> str:
-    """Click a DOM element by label via CDP — real mouse events at element center."""
+    """Click a DOM element by its name.
+
+    If element_name exists in the last CDP tool list, uses its stable target data.
+    Otherwise falls back to best-effort label search.
+    """
+    tool = _cdp_tool_map.get(element_name)
+    if tool:
+        return _cdp_click_tool(tool)
+    # Legacy fallback: label scan in top-level document only.
     ws = _cdp_ws()
     safe = element_name.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
-    # Step 1: Find element and return its center coordinates
     js = f"""(() => {{
         const target = '{safe}';
         const selectors = '{_INTERACTIVE_SELECTORS}';
         for (const el of document.querySelectorAll(selectors)) {{
-            const label = el.getAttribute('aria-label') || el.placeholder || (el.textContent||'').trim().substring(0,60) || el.name || el.id;
+            const label = el.getAttribute('aria-label') || el.placeholder || (el.textContent||'').trim().substring(0,120) || el.name || el.id;
             if (label === target) {{
                 const r = el.getBoundingClientRect();
                 return JSON.stringify({{x: r.x + r.width/2, y: r.y + r.height/2}});
@@ -305,53 +433,18 @@ def _cdp_click(element_name: str) -> str:
         }}
         return 'not_found';
     }})()"""
-    ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": js, "returnByValue": True}}))
-    result = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", "error")
-    if result == "not_found":
+    resp = _cdp_eval(ws, js, msg_id=1)
+    val = resp.get("result", {}).get("result", {}).get("value", "error")
+    if val == "not_found":
         ws.close()
         raise RuntimeError(f"CDP: '{element_name}' not found")
-    coords = json.loads(result)
-    x, y = coords["x"], coords["y"]
-    # Step 2: Dispatch real mouse events at element center
-    for eid, method_type in [(2, "mousePressed"), (3, "mouseReleased")]:
-        ws.send(json.dumps({"id": eid, "method": "Input.dispatchMouseEvent", "params": {
-            "type": method_type, "x": x, "y": y, "button": "left", "clickCount": 1
-        }}))
-        ws.recv()
+    coords = json.loads(val)
+    _cdp_dispatch_click(ws, coords["x"], coords["y"], msg_id_base=2)
     ws.close()
     return "clicked"
 
 
-def _cdp_type(text: str, target: str = "") -> str:
-    """Type text via CDP — simulated keyboard events for every character. Works everywhere."""
-    ws = _cdp_ws()
-    if target:
-        safe = target.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
-        js = f"""(() => {{
-            const t = '{safe}';
-            const selectors = '{_INTERACTIVE_SELECTORS}';
-            for (const el of document.querySelectorAll(selectors)) {{
-                const label = el.getAttribute('aria-label') || el.placeholder || (el.textContent||'').trim().substring(0,60) || el.name || el.id;
-                if (label === t) {{
-                    const r = el.getBoundingClientRect();
-                    return JSON.stringify({{x: r.x + r.width/2, y: r.y + r.height/2}});
-                }}
-            }}
-            return 'not_found';
-        }})()"""
-        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {"expression": js, "returnByValue": True}}))
-        result = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", "error")
-        if result == "not_found":
-            ws.close()
-            raise RuntimeError(f"CDP: '{target}' not found")
-        coords = json.loads(result)
-        x, y = coords["x"], coords["y"]
-        # Real click to focus the input field
-        for eid, method_type in [(10, "mousePressed"), (11, "mouseReleased")]:
-            ws.send(json.dumps({"id": eid, "method": "Input.dispatchMouseEvent", "params": {
-                "type": method_type, "x": x, "y": y, "button": "left", "clickCount": 1
-            }}))
-            ws.recv()
+def _cdp_send_keys(ws, text: str, msg_id_start: int = 20) -> None:
     # Simulated keyboard — keyDown → keyUp for all keys.
     # Regular chars + Enter: keyDown with "text" property. Tab: keyDown without text.
     # NO "char" events (causes double input).
@@ -359,7 +452,7 @@ def _cdp_type(text: str, target: str = "") -> str:
         "\t": ("Tab", "Tab", 9, None),      # no text
         "\n": ("Enter", "Enter", 13, "\r"),  # text=\r (Puppeteer convention)
     }
-    msg_id = 20
+    msg_id = msg_id_start
     for ch in text:
         if ch in special_keys:
             key_val, code, vk, txt = special_keys[ch]
@@ -375,20 +468,123 @@ def _cdp_type(text: str, target: str = "") -> str:
             }}))
             ws.recv(); msg_id += 1
         else:
-            kc = ord(ch.upper()) if ch.isalpha() else ord(ch)
-            cd = f"Key{ch.upper()}" if ch.isalpha() else ""
-            # keyDown with text → inserts the character
-            ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": {
-                "type": "keyDown", "key": ch, "text": ch,
-                "code": cd, "windowsVirtualKeyCode": kc, "nativeVirtualKeyCode": kc
-            }}))
-            ws.recv(); msg_id += 1
-            # keyUp — no text needed
-            ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": {
-                "type": "keyUp", "key": ch,
-                "code": cd, "windowsVirtualKeyCode": kc, "nativeVirtualKeyCode": kc
-            }}))
-            ws.recv(); msg_id += 1
+            # IMPORTANT: Don't use ord(ch) as Windows VK for punctuation.
+            # Example: ord('(')=40 which is VK_DOWN. This makes Chromium drop/mis-handle '('.
+            # Minimal fix: properly map only the collision-prone ASCII punctuation set (US layout).
+            punct_map = {
+                "!": ("Digit1", 49, 8), "@": ("Digit2", 50, 8), "#": ("Digit3", 51, 8),
+                "$": ("Digit4", 52, 8), "%": ("Digit5", 53, 8), "^": ("Digit6", 54, 8),
+                "&": ("Digit7", 55, 8), "*": ("Digit8", 56, 8), "(": ("Digit9", 57, 8),
+                "*": ("Digit8", 56, 8), "(": ("Digit9", 57, 8), ")": ("Digit0", 48, 8),
+                "=": ("Equal", 187, 0), "+": ("Equal", 187, 8), ";": ("Semicolon", 186, 0),
+                ":": ("Semicolon", 186, 8), ",": ("Comma", 188, 0), "<": ("Comma", 188, 8),
+                "-": ("Minus", 189, 0), "_": ("Minus", 189, 8), ".": ("Period", 190, 0),
+                ">": ("Period", 190, 8), "/": ("Slash", 191, 0), "?": ("Slash", 191, 8),
+                "`": ("Backquote", 192, 0), "~": ("Backquote", 192, 8), "[": ("BracketLeft", 219, 0),
+                "{": ("BracketLeft", 219, 8), "]": ("BracketRight", 221, 0), "}": ("BracketRight", 221, 8),
+                "\\": ("Backslash", 220, 0), "|": ("Backslash", 220, 8), "'": ("Quote", 222, 0),
+                "\"": ("Quote", 222, 8),
+            }
+
+            if ch in punct_map:
+                code, vk, modifiers = punct_map[ch]
+                ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": {
+                    "type": "keyDown",
+                    "key": ch,
+                    "code": code,
+                    "windowsVirtualKeyCode": vk,
+                    "nativeVirtualKeyCode": vk,
+                    "modifiers": modifiers,
+                    "text": ch,
+                    "unmodifiedText": ch,
+                }}))
+                ws.recv(); msg_id += 1
+                ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": {
+                    "type": "keyUp",
+                    "key": ch,
+                    "code": code,
+                    "windowsVirtualKeyCode": vk,
+                    "nativeVirtualKeyCode": vk,
+                    "modifiers": modifiers,
+                }}))
+                ws.recv(); msg_id += 1
+            elif ch.isalpha():
+                kc = ord(ch.upper())
+                cd = f"Key{ch.upper()}"
+                ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": {
+                    "type": "keyDown", "key": ch, "text": ch,
+                    "code": cd, "windowsVirtualKeyCode": kc, "nativeVirtualKeyCode": kc
+                }}))
+                ws.recv(); msg_id += 1
+                ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": {
+                    "type": "keyUp", "key": ch,
+                    "code": cd, "windowsVirtualKeyCode": kc, "nativeVirtualKeyCode": kc
+                }}))
+                ws.recv(); msg_id += 1
+            elif ch.isdigit():
+                kc = ord(ch)
+                cd = f"Digit{ch}"
+                ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": {
+                    "type": "keyDown", "key": ch, "text": ch,
+                    "code": cd, "windowsVirtualKeyCode": kc, "nativeVirtualKeyCode": kc
+                }}))
+                ws.recv(); msg_id += 1
+                ws.send(json.dumps({"id": msg_id, "method": "Input.dispatchKeyEvent", "params": {
+                    "type": "keyUp", "key": ch,
+                    "code": cd, "windowsVirtualKeyCode": kc, "nativeVirtualKeyCode": kc
+                }}))
+                ws.recv(); msg_id += 1
+            else:
+                # Unknown char: best-effort insertText (avoids bad VK mapping)
+                ws.send(json.dumps({"id": msg_id, "method": "Input.insertText", "params": {"text": ch}}))
+                ws.recv(); msg_id += 1
+    return None
+
+
+def _cdp_type_to_tool(text: str, tool: dict) -> str:
+    """Focus a tool target (if available) and type text via CDP."""
+    ws = _cdp_ws()
+    coords = _cdp_find_coords_for_tool(ws, tool)
+    if coords:
+        _cdp_dispatch_click(ws, coords["x"], coords["y"], msg_id_base=10)
+    _cdp_send_keys(ws, text, msg_id_start=20)
+    ws.close()
+    return "typed"
+
+
+def _cdp_type(text: str, target: str = "") -> str:
+    """Type text via CDP — simulated keyboard events for every character. Works everywhere.
+
+    If target matches a tool from the last ds_update_view, focuses it via stable target data.
+    Otherwise falls back to best-effort label search + click.
+    """
+    tool = _cdp_tool_map.get(target) if target else None
+    if tool:
+        return _cdp_type_to_tool(text, tool)
+
+    ws = _cdp_ws()
+    if target:
+        safe = target.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+        js = f"""(() => {{
+            const t = '{safe}';
+            const selectors = '{_INTERACTIVE_SELECTORS}';
+            for (const el of document.querySelectorAll(selectors)) {{
+                const label = el.getAttribute('aria-label') || el.placeholder || (el.textContent||'').trim().substring(0,120) || el.name || el.id;
+                if (label === t) {{
+                    const r = el.getBoundingClientRect();
+                    return JSON.stringify({{x: r.x + r.width/2, y: r.y + r.height/2}});
+                }}
+            }}
+            return 'not_found';
+        }})()"""
+        resp = _cdp_eval(ws, js, msg_id=1)
+        val = resp.get("result", {}).get("result", {}).get("value", "error")
+        if val == "not_found":
+            ws.close()
+            raise RuntimeError(f"CDP: '{target}' not found")
+        coords = json.loads(val)
+        _cdp_dispatch_click(ws, coords["x"], coords["y"], msg_id_base=10)
+    _cdp_send_keys(ws, text, msg_id_start=20)
     ws.close()
     return "typed"
 
@@ -1335,22 +1531,145 @@ def _cdp_extract() -> dict:
 
     js = r'''(() => {
         const vw = window.innerWidth, vh = window.innerHeight;
-        const tools = [], seen = new Set();
-        document.querySelectorAll('__SELECTORS__').forEach(el => {
+        const SELECTORS = '__SELECTORS__';
+        const tools = [];
+        const labelCounts = new Map();
+
+        function nextId(prefix = '') {
+            try {
+                const w = window;
+                w.__ds_mcp_seq = (w.__ds_mcp_seq || 0) + 1;
+                return `${prefix}ds${w.__ds_mcp_seq}`;
+            } catch (_) {
+                return `${prefix}ds${Math.floor(Math.random()*1e9)}`;
+            }
+        }
+
+        function labelFor(el) {
+            const raw =
+                el.getAttribute?.('aria-label') ||
+                el.placeholder ||
+                (el.textContent || '').trim() ||
+                el.name ||
+                el.id ||
+                '';
+            return (raw || '').trim().replace(/\s+/g, ' ').slice(0, 120);
+        }
+
+        function isVisible(el, r, offX, offY) {
+            if (!r.width || !r.height) return false;
+            const x = offX + r.x + r.width/2;
+            const y = offY + r.y + r.height/2;
+            if (x < 0 || y < 0 || x > vw || y > vh) return false;
+            try {
+                const s = getComputedStyle(el);
+                if (s.opacity === '0' || s.visibility === 'hidden' || s.display === 'none') return false;
+                if (s.pointerEvents === 'none') return false;
+            } catch (_) {}
+            if (el.disabled) return false;
+            return true;
+        }
+
+        function actionFor(el) {
+            const tag = (el.tagName || '').toLowerCase();
+            const role = (el.getAttribute && el.getAttribute('role')) || '';
+            if (tag === 'select') return 'click'; // treat as click (select handling is app-specific)
+            if (['input', 'textarea'].includes(tag)) return 'type';
+            if (['textbox', 'searchbox', 'combobox'].includes(role)) return 'type';
+            if (el.isContentEditable) return 'type';
+            return 'click';
+        }
+
+        function cssPath(el) {
+            // Best-effort selector for top-level DOM only (doesn't pierce iframes/shadow roots).
+            if (!el || !el.tagName) return '';
+            if (el.id) return `#${CSS.escape(el.id)}`;
+            const parts = [];
+            let cur = el;
+            while (cur && cur.nodeType === 1 && parts.length < 10) {
+                const tag = cur.tagName.toLowerCase();
+                if (tag === 'html') break;
+                let nth = 1;
+                let sib = cur;
+                while ((sib = sib.previousElementSibling)) {
+                    if (sib.tagName === cur.tagName) nth++;
+                }
+                parts.unshift(`${tag}:nth-of-type(${nth})`);
+                cur = cur.parentElement;
+                if (cur && cur.tagName && cur.tagName.toLowerCase() === 'body') {
+                    parts.unshift('body');
+                    break;
+                }
+            }
+            return parts.join(' > ');
+        }
+
+        function pushTool(el, offX, offY, prefix, allowSelector) {
+            const base = labelFor(el);
+            if (!base) return;
             const r = el.getBoundingClientRect();
-            if (!r.width || !r.height || r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) return;
-            const s = getComputedStyle(el);
-            if (s.opacity === '0' || s.visibility === 'hidden' || s.pointerEvents === 'none') return;
-            const label = el.getAttribute('aria-label') || el.placeholder || (el.textContent||'').trim().substring(0,60) || el.name || el.id;
-            if (!label || seen.has(label)) return;
-            seen.add(label);
-            const tag = el.tagName.toLowerCase();
-            const role = el.getAttribute('role') || '';
-            let action = 'click';
-            if (['input','textarea'].includes(tag) || ['textbox','searchbox','combobox'].includes(role) || el.contentEditable==='true') action = 'type';
-            if (tag === 'select') action = 'select';
-            tools.push(action + '|' + label);
-        });
+            if (!isVisible(el, r, offX, offY)) return;
+
+            const count = (labelCounts.get(base) || 0) + 1;
+            labelCounts.set(base, count);
+            const display = count === 1 ? base : `${base} (${count})`;
+
+            let dsid = '';
+            try {
+                dsid = el.getAttribute('data-ds-mcp') || '';
+                if (!dsid) {
+                    dsid = nextId(prefix);
+                    el.setAttribute('data-ds-mcp', dsid);
+                }
+            } catch (_) {}
+
+            const x = offX + r.x + r.width/2;
+            const y = offY + r.y + r.height/2;
+
+            tools.push({
+                action: actionFor(el),
+                element: display,
+                dsid: dsid,
+                selector: (allowSelector ? cssPath(el) : ''),
+                x: x,
+                y: y
+            });
+        }
+
+        function collectInDocument(doc, offX, offY, prefix, allowSelector) {
+            try {
+                doc.querySelectorAll(SELECTORS).forEach(el => pushTool(el, offX, offY, prefix, allowSelector));
+            } catch (_) {}
+
+            // Traverse open shadow roots and collect interactives inside them.
+            try {
+                const tw = doc.createTreeWalker(doc, NodeFilter.SHOW_ELEMENT);
+                while (tw.nextNode()) {
+                    const node = tw.currentNode;
+                    if (node && node.shadowRoot) {
+                        try {
+                            node.shadowRoot.querySelectorAll(SELECTORS).forEach(el => pushTool(el, offX, offY, prefix, false));
+                        } catch (_) {}
+                    }
+                }
+            } catch (_) {}
+        }
+
+        // 1) Main document
+        collectInDocument(document, 0, 0, '', true);
+
+        // 2) Same-origin iframes (best effort): extract + offset coords by iframe rect
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        for (let i = 0; i < iframes.length; i++) {
+            const iframe = iframes[i];
+            try {
+                const idoc = iframe.contentDocument;
+                if (!idoc) continue;
+                const ir = iframe.getBoundingClientRect();
+                collectInDocument(idoc, ir.x, ir.y, `f${i}_`, false);
+            } catch (_) {}
+        }
+
         // Viewport-only text: only LEAF block elements (no block children = no duplication)
         const blockTags = new Set(['P','H1','H2','H3','H4','H5','H6','LI','TD','TH','DT','DD','PRE','BLOCKQUOTE','FIGCAPTION','ARTICLE','SECTION','HEADER','FOOTER','MAIN','ASIDE','NAV','DIV','SPAN','A','LABEL']);
         const blocks = document.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,td,th,dt,dd,pre,blockquote,figcaption,label,span,div,a,article,section');
@@ -1384,12 +1703,24 @@ def _cdp_extract() -> dict:
     ws.close()
 
     tools = []
-    for line in data["tools"]:
-        parts = line.split("|", 1)
-        if len(parts) == 2:
-            tools.append({"action": parts[0], "element": parts[1], "description": ""})
+    for t in data.get("tools", []):
+        if not isinstance(t, dict):
+            continue
+        action = t.get("action") or "click"
+        element = t.get("element") or ""
+        if not element:
+            continue
+        tools.append({
+            "action": action,
+            "element": element,
+            "description": "",
+            "dsid": t.get("dsid") or "",
+            "selector": t.get("selector") or "",
+            "x": t.get("x"),
+            "y": t.get("y"),
+        })
 
-    return {"tools": tools, "text": data["text"].strip(), "title": ""}
+    return {"tools": tools, "text": (data.get("text") or "").strip(), "title": ""}
 
 
 @mcp.tool()
@@ -1410,7 +1741,7 @@ def ds_update_view(prev_ok: str, app: Optional[str] = None) -> str:
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
     _log_action("ds_update_view", {}, "", prev_ok)
-    global _active_view, _cdp_labels
+    global _active_view, _cdp_labels, _cdp_tool_map
 
     # --- Deterministic CDP path (only for browser apps) ---
     cdp = None
@@ -1423,6 +1754,7 @@ def ds_update_view(prev_ok: str, app: Optional[str] = None) -> str:
     if cdp and cdp["tools"]:
         _active_view = {"screen": cdp["text"], "tools": cdp["tools"], "data": ""}
         _cdp_labels = {t["element"] for t in cdp["tools"]}
+        _cdp_tool_map = {t["element"]: t for t in cdp["tools"] if isinstance(t, dict) and t.get("element")}
 
         tool_lines = []
         for i, t in enumerate(cdp["tools"], 1):
@@ -1448,6 +1780,7 @@ def ds_update_view(prev_ok: str, app: Optional[str] = None) -> str:
 
     _active_view = {"screen": a11y, "tools": tools, "data": ""}
     _cdp_labels = set()
+    _cdp_tool_map = {}
 
     tool_lines = []
     for i, t in enumerate(tools, 1):
@@ -1560,14 +1893,14 @@ def ds_act(tool_number: int, prev_ok: str, text: Optional[str] = None, app: Opti
         if not text:
             raise ValueError(f"Tool {tool_number} is a type action — provide text parameter.")
         if _is_cdp_available():
-            _cdp_type(text, element)
+            _cdp_type_to_tool(text, tool)
             r = f"ok cdp{_learning_hint()}"
         else:
             action_id = _inject_action("type", text=text, target=element, app=app)
             r = f"ok #{action_id}{_learning_hint()}"
     else:
         if _is_cdp_available():
-            _cdp_click(element)
+            _cdp_click_tool(tool)
             r = f"ok cdp{_learning_hint()}"
         else:
             action_id = _inject_action("click", target=element, app=app)
