@@ -74,7 +74,10 @@ mcp = FastMCP(
         "Read any screen as structured text. Control any app via named elements. "
         "Powered by DirectShell and the Windows Accessibility Layer.\n\n"
         "**NEW TO DIRECTSHELL? Call ds_guide() first.** It explains every tool and the workflow.\n\n"
-        "**Quick start:** ds_apps() → ds_focus('app') → ds_update_view() → ds_act(N)"
+        "**Quick start:** ds_apps() → ds_focus('app') → ds_update_view() → ds_act(N)\n\n"
+        "**Mobile mode:** Use ds_mobile() to switch browser to mobile layout. "
+        "Mobile pages are simpler, faster to parse, and have fewer elements. "
+        "Ideal for search, booking, shopping, and form-filling tasks."
     ),
 )
 
@@ -267,6 +270,7 @@ def _is_cdp_available() -> bool:
 
 _cdp_active_tab_id: Optional[str] = None  # Track which tab we're focused on
 _cdp_tool_map: dict[str, dict] = {}  # display label -> tool dict from last ds_update_view()
+_cdp_mobile_mode: bool = False  # Track mobile emulation state
 
 def _cdp_tabs() -> list[dict]:
     """Get all CDP browser tabs."""
@@ -922,6 +926,62 @@ def ds_navigate(url: str, prev_ok: str) -> str:
     frame_id = result.get("result", {}).get("frameId", "")
     r = f"Navigated to {url}" if frame_id else f"Navigation sent to {url}"
     _log_action("ds_navigate", {"url": url}, r, prev_ok)
+    return r
+
+
+@mcp.tool()
+def ds_mobile(prev_ok: str, enabled: bool = True) -> str:
+    """Toggle mobile device emulation in the browser (CDP/browser mode).
+
+    Switches the active tab to a mobile viewport (iPhone-like: 375x812) with a
+    mobile User-Agent. Mobile pages have simpler layouts, fewer elements, and
+    are faster to parse — ideal for search, booking, and form-filling tasks.
+
+    Call ds_update_view() after switching to see the new layout.
+
+    Args:
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
+        enabled: True to enable mobile emulation, False to disable and restore desktop.
+    """
+    global _cdp_mobile_mode
+    if not _is_cdp_available():
+        return "CDP not available."
+    ws = _cdp_ws()
+    if enabled:
+        # Set mobile viewport (iPhone 14 Pro dimensions)
+        ws.send(json.dumps({"id": 1, "method": "Emulation.setDeviceMetricsOverride", "params": {
+            "width": 375, "height": 812, "deviceScaleFactor": 3, "mobile": True
+        }}))
+        ws.recv()
+        # Set mobile User-Agent
+        mobile_ua = (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        )
+        ws.send(json.dumps({"id": 2, "method": "Network.setUserAgentOverride", "params": {
+            "userAgent": mobile_ua,
+            "platform": "iPhone",
+            "userAgentMetadata": {
+                "mobile": True, "platform": "iOS",
+                "brands": [{"brand": "Safari", "version": "17"}]
+            }
+        }}))
+        ws.recv()
+        _cdp_mobile_mode = True
+        ws.close()
+        r = "Mobile emulation ON (375x812, iPhone UA). Reload/navigate to apply."
+    else:
+        # Clear overrides — restore desktop
+        ws.send(json.dumps({"id": 1, "method": "Emulation.clearDeviceMetricsOverride"}))
+        ws.recv()
+        ws.send(json.dumps({"id": 2, "method": "Network.setUserAgentOverride", "params": {
+            "userAgent": ""
+        }}))
+        ws.recv()
+        _cdp_mobile_mode = False
+        ws.close()
+        r = "Mobile emulation OFF (desktop restored). Reload/navigate to apply."
+    _log_action("ds_mobile", {"enabled": enabled}, r, prev_ok)
     return r
 
 
