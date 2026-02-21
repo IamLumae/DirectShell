@@ -41,14 +41,30 @@ from pathlib import Path
 from typing import Optional
 
 from fastmcp import FastMCP
+from tip_engine import tip_engine as _tip_engine
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_PROFILES = str(
-    Path(__file__).resolve().parent.parent / "target" / "release" / "ds_profiles"
-)
+def _discover_profiles_dir() -> str:
+    """Find ds_profiles directory automatically.
+    Priority: 1) --profiles CLI arg  2) DS_PROFILES env  3) DS breadcrumb file  4) dev fallback"""
+    # Check if DS left a breadcrumb with its absolute path
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    if local_app:
+        breadcrumb = Path(local_app) / "DirectShell" / "profiles_path.txt"
+        if breadcrumb.exists():
+            try:
+                path = breadcrumb.read_text(encoding="utf-8").strip()
+                if path and Path(path).exists():
+                    return path
+            except Exception:
+                pass
+    # Dev fallback: target/release/ds_profiles
+    return str(Path(__file__).resolve().parent.parent / "target" / "release" / "ds_profiles")
+
+DEFAULT_PROFILES = _discover_profiles_dir()
 
 def get_profiles_dir() -> Path:
     """Resolve the ds_profiles directory from CLI args or default."""
@@ -62,6 +78,9 @@ def get_profiles_dir() -> Path:
 
 PROFILES_DIR = get_profiles_dir()
 PROFILES_JSON = PROFILES_DIR / "app_profiles.json"
+
+# Initialize tip engine with tips directory
+_tip_engine.init(Path(__file__).resolve().parent / "tips")
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -77,7 +96,14 @@ mcp = FastMCP(
         "**Quick start:** ds_apps() → ds_focus('app') → ds_update_view() → ds_act(N)\n\n"
         "**Mobile mode:** Use ds_mobile() to switch browser to mobile layout. "
         "Mobile pages are simpler, faster to parse, and have fewer elements. "
-        "Ideal for search, booking, shopping, and form-filling tasks."
+        "Ideal for search, booking, shopping, and form-filling tasks.\n\n"
+        "**Smart waiting:** ds_wait(text='Search results') waits until specific text appears on the page. "
+        "Much more reliable than time-based waiting.\n\n"
+        "**Action + View combo:** ds_act(N, include_view=True) executes an action AND returns the updated view "
+        "in one call — saves a round-trip vs calling ds_act then ds_update_view separately.\n\n"
+        "**Overlay modes:** ds_overlay(visible=False) hides the overlay for autonomous agent work. "
+        "ds_overlay(visible=True) shows it again for human interaction. "
+        "Both modes have full functionality — only the visual overlay changes."
     ),
 )
 
@@ -89,6 +115,10 @@ _ACTION_LOG_DIR = PROFILES_DIR / "action_log"
 
 def _log_action(tool_name: str, params: dict, result: str, prev_ok: str):
     """Log an MCP action with success feedback from previous action. Never raises."""
+    try:
+        _tip_engine.update_context(tool_name, params, result, prev_ok)
+    except Exception:
+        pass  # tip engine must never break tool execution
     try:
         _ACTION_LOG_DIR.mkdir(exist_ok=True)
         ctx = {}
@@ -122,10 +152,17 @@ def _log_action(tool_name: str, params: dict, result: str, prev_ok: str):
 # ---------------------------------------------------------------------------
 
 def _read_active() -> dict:
-    """Read is_active file. Returns {snapped: bool, app: str, a11y: str, snap: str}."""
+    """Read is_active file. Returns {snapped: bool, app: str, a11y: str, snap: str}.
+    If the file is stale (>10s old), treat as not snapped — DS heartbeats every 1-2s."""
     active_file = PROFILES_DIR / "is_active"
     if not active_file.exists():
         return {"snapped": False, "app": "none", "a11y": "", "snap": ""}
+    try:
+        age = time.time() - active_file.stat().st_mtime
+        if age > 10:
+            return {"snapped": False, "app": "none", "a11y": "", "snap": ""}
+    except Exception:
+        pass
     lines = active_file.read_text(encoding="utf-8").strip().splitlines()
     app = lines[0] if lines else "none"
     if app == "none" or not lines:
@@ -136,6 +173,25 @@ def _read_active() -> dict:
         "a11y": lines[1] if len(lines) > 1 else "",
         "snap": lines[2] if len(lines) > 2 else "",
     }
+
+
+def _is_ds_running() -> bool:
+    """Check if DirectShell is alive by looking at the is_active file's age.
+    DS writes this file every few seconds. If it's stale (>10s) or missing, DS is dead."""
+    active_file = PROFILES_DIR / "is_active"
+    if not active_file.exists():
+        return False
+    try:
+        age = time.time() - active_file.stat().st_mtime
+        return age < 10  # DS writes this every ~2s; 10s = generous margin
+    except Exception:
+        return False
+
+
+def _require_ds():
+    """Raise an error if DirectShell is not running. Call at the top of every tool."""
+    if not _is_ds_running():
+        raise RuntimeError("DirectShell is not running. Start directshell.exe first.")
 
 
 def _get_snapped_app() -> str:
@@ -190,78 +246,93 @@ def _db_query(sql: str, app: Optional[str] = None) -> list[dict]:
 # Note: tabindex catches many non-interactive elements; exclude tabindex=-1.
 _INTERACTIVE_SELECTORS = 'input,textarea,select,button,[role="button"],[role="textbox"],[role="menuitem"],[role="link"],[role="checkbox"],[role="radio"],[role="combobox"],[role="searchbox"],[role="tab"],[role="option"],[role="listitem"],[role="treeitem"],[role="gridcell"],[role="switch"],[role="slider"],[contenteditable="true"],[tabindex]:not([tabindex="-1"]),a[href]'
 
-# --- Shared JS for viewport-only text extraction (used by ds_update_view + ds_screen) ---
-_VIEWPORT_TEXT_JS = r'''(() => {
-    const vh = window.innerHeight;
-    const blockTags = new Set(['P','H1','H2','H3','H4','H5','H6','LI','TD','TH','DT','DD','PRE','BLOCKQUOTE','FIGCAPTION','ARTICLE','SECTION','HEADER','FOOTER','MAIN','ASIDE','NAV','DIV','SPAN','A','LABEL']);
+# --- Shared JS template for text extraction (viewport-only vs full-page) ---
+def _make_text_js(viewport_only: bool) -> str:
+    """Generate JS for extracting visible text from the page.
+    viewport_only=True: only elements within the viewport (ds_screen, ds_update_view)
+    viewport_only=False: all elements on the page (ds_print)
+    """
+    bounds_check = (
+        "if (!r.height || r.bottom < 0 || r.top > vh) continue;\n"
+        "        if (r.height > vh * 1.5) continue;"
+    ) if viewport_only else "if (!r.height) continue;"
+    vh_line = "const vh = window.innerHeight;\n    " if viewport_only else ""
+    return f'''(() => {{
+    {vh_line}const blockTags = new Set(['P','H1','H2','H3','H4','H5','H6','LI','TD','TH','DT','DD','PRE','BLOCKQUOTE','FIGCAPTION','ARTICLE','SECTION','HEADER','FOOTER','MAIN','ASIDE','NAV','DIV','SPAN','A','LABEL']);
     const blocks = document.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,td,th,dt,dd,pre,blockquote,figcaption,label,span,div,a,article,section');
     const parts = [], seen = new Set();
-    for (const el of blocks) {
+    for (const el of blocks) {{
         const r = el.getBoundingClientRect();
-        if (!r.height || r.bottom < 0 || r.top > vh) continue;
-        if (r.height > vh * 1.5) continue;
+        {bounds_check}
         const s = getComputedStyle(el);
         if (s.opacity === '0' || s.visibility === 'hidden' || s.display === 'none') continue;
         let hasBlockChild = false;
-        for (const child of el.children) {
-            if (blockTags.has(child.tagName) && child.getBoundingClientRect().height > 0) {
+        for (const child of el.children) {{
+            if (blockTags.has(child.tagName) && child.getBoundingClientRect().height > 0) {{
                 const cs = getComputedStyle(child);
-                if (cs.display !== 'inline' && cs.display !== 'inline-block') { hasBlockChild = true; break; }
-            }
-        }
+                if (cs.display !== 'inline' && cs.display !== 'inline-block') {{ hasBlockChild = true; break; }}
+            }}
+        }}
         if (hasBlockChild) continue;
         const t = el.innerText?.trim();
         if (!t || t.length < 2 || seen.has(t)) continue;
         seen.add(t);
         parts.push(t);
-    }
-    return parts.join('\n');
-})()'''
+    }}
+    return parts.join('\\n');
+}})()'''
 
-# --- JS for full-page text extraction (used by ds_print) ---
-_FULLPAGE_TEXT_JS = r'''(() => {
-    const blockTags = new Set(['P','H1','H2','H3','H4','H5','H6','LI','TD','TH','DT','DD','PRE','BLOCKQUOTE','FIGCAPTION','ARTICLE','SECTION','HEADER','FOOTER','MAIN','ASIDE','NAV','DIV','SPAN','A','LABEL']);
-    const blocks = document.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,td,th,dt,dd,pre,blockquote,figcaption,label,span,div,a,article,section');
-    const parts = [], seen = new Set();
-    for (const el of blocks) {
-        const r = el.getBoundingClientRect();
-        if (!r.height) continue;
-        const s = getComputedStyle(el);
-        if (s.opacity === '0' || s.visibility === 'hidden' || s.display === 'none') continue;
-        let hasBlockChild = false;
-        for (const child of el.children) {
-            if (blockTags.has(child.tagName) && child.getBoundingClientRect().height > 0) {
-                const cs = getComputedStyle(child);
-                if (cs.display !== 'inline' && cs.display !== 'inline-block') { hasBlockChild = true; break; }
-            }
-        }
-        if (hasBlockChild) continue;
-        const t = el.innerText?.trim();
-        if (!t || t.length < 2 || seen.has(t)) continue;
-        seen.add(t);
-        parts.push(t);
-    }
-    return parts.join('\n');
-})()'''
+_VIEWPORT_TEXT_JS = _make_text_js(viewport_only=True)
+_FULLPAGE_TEXT_JS = _make_text_js(viewport_only=False)
 
 
-_BROWSER_APPS = {"opera", "chrome", "edge", "firefox", "brave", "vivaldi", "chromium"}
+_BROWSER_APPS = {"opera", "chrome", "edge", "firefox", "brave", "vivaldi", "chromium",
+                  "google_chrome", "opera_gx", "microsoft_edge", "brave_browser"}
 
-def _is_cdp_available() -> bool:
-    """Check if CDP should be used: snapped app must be a browser AND port 9222 must be open.
-    Non-browser apps (Discord, etc.) always use UIA even if a browser is running in the background."""
-    # Check if snapped app is a browser
+# Per-browser CDP port mapping (must match main.rs BROWSER_CDP_PORTS)
+_CDP_PORT_MAP = {
+    "chrome": 9222, "google_chrome": 9222,
+    "opera": 9223, "opera_gx": 9223,
+    "edge": 9224, "microsoft_edge": 9224, "msedge": 9224,
+    "brave": 9225, "brave_browser": 9225,
+    "vivaldi": 9226,
+    "chromium": 9227,
+}
+_CDP_DEFAULT_PORT = 9222
+
+def _get_cdp_port() -> int:
+    """Get the CDP port for the currently snapped browser."""
     try:
         status = _read_active()
-        if status["snapped"] and status["app"] not in _BROWSER_APPS:
-            return False  # Native app snapped — never use CDP
+        app = status.get("app", "").lower()
+        # Try exact match first, then check if any key is contained in app name
+        if app in _CDP_PORT_MAP:
+            return _CDP_PORT_MAP[app]
+        for key, port in _CDP_PORT_MAP.items():
+            if key in app:
+                return port
     except Exception:
         pass
-    # Check if CDP port is actually open
+    return _CDP_DEFAULT_PORT
+
+def _is_cdp_available() -> bool:
+    """Check if CDP should be used: DS must be snapped to a browser AND its CDP port must be open.
+    Returns False if DS is not running, not snapped, or snapped to a non-browser app."""
+    try:
+        status = _read_active()
+        if not status["snapped"]:
+            return False  # Not snapped to anything — no CDP
+        app = status["app"].lower()
+        if not any(browser in app for browser in _BROWSER_APPS):
+            return False  # Snapped to non-browser — no CDP
+    except Exception:
+        return False  # Can't read status (DS not running?) — no CDP
+    # Snapped to a browser — check if its CDP port is actually open
+    port = _get_cdp_port()
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(0.3)
-        result = s.connect_ex(("127.0.0.1", 9222))
+        result = s.connect_ex(("127.0.0.1", port))
         s.close()
         return result == 0
     except Exception:
@@ -274,7 +345,8 @@ _cdp_mobile_mode: bool = False  # Track mobile emulation state
 
 def _cdp_tabs() -> list[dict]:
     """Get all CDP browser tabs."""
-    return requests.get("http://127.0.0.1:9222/json/list", timeout=2).json()
+    port = _get_cdp_port()
+    return requests.get(f"http://127.0.0.1:{port}/json/list", timeout=2).json()
 
 def _cdp_ws(tab_id: Optional[str] = None):
     """Get a CDP websocket connection. Uses tracked active tab, or first page tab."""
@@ -419,6 +491,7 @@ def _cdp_click(element_name: str) -> str:
     If element_name exists in the last CDP tool list, uses its stable target data.
     Otherwise falls back to best-effort label search.
     """
+    element_name = element_name.strip()
     tool = _cdp_tool_map.get(element_name)
     if tool:
         return _cdp_click_tool(tool)
@@ -426,10 +499,10 @@ def _cdp_click(element_name: str) -> str:
     ws = _cdp_ws()
     safe = element_name.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
     js = f"""(() => {{
-        const target = '{safe}';
+        const target = '{safe}'.trim();
         const selectors = '{_INTERACTIVE_SELECTORS}';
         for (const el of document.querySelectorAll(selectors)) {{
-            const label = el.getAttribute('aria-label') || el.placeholder || (el.textContent||'').trim().substring(0,120) || el.name || el.id;
+            const label = (el.getAttribute('aria-label') || el.placeholder || (el.textContent||'').trim().substring(0,120) || el.name || el.id || '').trim();
             if (label === target) {{
                 const r = el.getBoundingClientRect();
                 return JSON.stringify({{x: r.x + r.width/2, y: r.y + r.height/2}});
@@ -562,6 +635,7 @@ def _cdp_type(text: str, target: str = "") -> str:
     If target matches a tool from the last ds_update_view, focuses it via stable target data.
     Otherwise falls back to best-effort label search + click.
     """
+    target = target.strip() if target else target
     tool = _cdp_tool_map.get(target) if target else None
     if tool:
         return _cdp_type_to_tool(text, tool)
@@ -570,10 +644,10 @@ def _cdp_type(text: str, target: str = "") -> str:
     if target:
         safe = target.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
         js = f"""(() => {{
-            const t = '{safe}';
+            const t = '{safe}'.trim();
             const selectors = '{_INTERACTIVE_SELECTORS}';
             for (const el of document.querySelectorAll(selectors)) {{
-                const label = el.getAttribute('aria-label') || el.placeholder || (el.textContent||'').trim().substring(0,120) || el.name || el.id;
+                const label = (el.getAttribute('aria-label') || el.placeholder || (el.textContent||'').trim().substring(0,120) || el.name || el.id || '').trim();
                 if (label === t) {{
                     const r = el.getBoundingClientRect();
                     return JSON.stringify({{x: r.x + r.width/2, y: r.y + r.height/2}});
@@ -746,7 +820,7 @@ def ds_guide(prev_ok: str) -> str:
     what each tool does, and the standard workflow.
 
     DirectShell has two modes:
-    - Browser mode (CDP): When a Chromium browser runs with --remote-debugging-port=9222.
+    - Browser mode (CDP): When a Chromium browser runs with --remote-debugging-port.
       Uses Chrome DevTools Protocol for all interactions. Tools: ds_tabs, ds_tab, ds_navigate, ds_update_view, ds_screen, ds_click, ds_text, ds_type, ds_key, ds_scroll, ds_batch, ds_act.
     - Native app mode (UIA): For all other desktop applications (Discord, Notepad, SAP, etc.).
       Uses Windows UI Automation. Tools: ds_apps, ds_focus, ds_state, ds_elements, ds_query, ds_find, ds_events, plus all action tools.
@@ -771,6 +845,7 @@ def ds_status(prev_ok: str) -> dict:
     Args:
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     status = _read_active()
     return {"snapped": status["snapped"], "app": status["app"]}
 
@@ -785,6 +860,7 @@ def ds_apps(prev_ok: str) -> str:
     Args:
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     windows_file = PROFILES_DIR / "windows.json"
     if not windows_file.exists():
         return "DirectShell daemon not running. Wait 2 seconds and retry."
@@ -807,6 +883,17 @@ def ds_focus(app: str, prev_ok: str) -> dict:
         app: Application name as shown in ds_apps() (e.g., "discord", "notepad")
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
+    try:
+        _tip_engine.update_context("ds_focus", {"app": app}, "", prev_ok)
+    except Exception:
+        pass
+    # Invalidate cached tools from previous app — prevents stale ds_act() calls
+    global _active_view, _cdp_labels, _cdp_tool_map
+    _active_view = {"screen": "", "tools": [], "data": "", "raw_tools": []}
+    _cdp_labels = set()
+    _cdp_tool_map = {}
+
     # Clean up any old result
     result_file = PROFILES_DIR / "snap_result"
     if result_file.exists():
@@ -823,6 +910,9 @@ def ds_focus(app: str, prev_ok: str) -> dict:
             try:
                 result = json.loads(result_file.read_text(encoding="utf-8"))
                 result_file.unlink()
+                tips = _tip_engine.get_tips_block("ds_focus")
+                if tips:
+                    result["tips"] = tips
                 return result
             except (json.JSONDecodeError, OSError):
                 continue
@@ -830,8 +920,38 @@ def ds_focus(app: str, prev_ok: str) -> dict:
     # Timeout — check if is_active changed
     status = _read_active()
     if status["snapped"] and status["app"] == app.strip().lower():
-        return {"status": "ok", "app": app}
+        result = {"status": "ok", "app": app}
+        tips = _tip_engine.get_tips_block("ds_focus")
+        if tips:
+            result["tips"] = tips
+        return result
     return {"status": "timeout", "reason": f"DirectShell did not snap to '{app}' within 3 seconds."}
+
+
+@mcp.tool()
+def ds_overlay(prev_ok: str, visible: bool = True) -> str:
+    """Toggle DirectShell overlay visibility between human and agent mode.
+
+    Human mode (visible=True): Overlay frame visible on screen, user can drag it.
+    Agent mode (visible=False): Overlay completely hidden, AI controls everything via MCP.
+
+    DirectShell keeps working in both modes — accessibility tree, actions, CDP all
+    function identically. Only the visual overlay changes.
+
+    Args:
+        prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
+        visible: True for human mode (overlay shown), False for agent mode (overlay hidden).
+    """
+    _require_ds()
+    mode_file = PROFILES_DIR / "overlay_mode"
+    mode = "human" if visible else "agent"
+    mode_file.write_text(mode, encoding="utf-8")
+    # DS polls this file every 200ms and hides/shows the overlay accordingly
+    time.sleep(0.3)
+    if visible:
+        return "Overlay mode: HUMAN — overlay frame is visible on screen."
+    else:
+        return "Overlay mode: AGENT — overlay is hidden, AI has full autonomous control."
 
 
 @mcp.tool()
@@ -840,13 +960,15 @@ def ds_tabs(prev_ok: str) -> str:
 
     Returns numbered list: [1] Page Title | https://url.com
     Active tab marked with *. Use ds_tab(number_or_name) to switch.
-    Requires browser running with --remote-debugging-port=9222.
+    Requires browser running with --remote-debugging-port.
 
     Args:
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     if not _is_cdp_available():
-        return "CDP not available. Browser not running with --remote-debugging-port=9222."
+        port = _get_cdp_port()
+        return f"CDP not available. Browser not running with --remote-debugging-port={port}."
     tabs = _cdp_tabs()
     page_tabs = [t for t in tabs if t.get("type") == "page"]
     lines = []
@@ -854,6 +976,7 @@ def ds_tabs(prev_ok: str) -> str:
         active = " *" if t.get("id") == _cdp_active_tab_id else ""
         lines.append(f"[{i}]{active} {t.get('title', '?')} | {t.get('url', '?')}")
     result = "\n".join(lines) if lines else "No tabs found."
+    result += _tip_engine.get_tips_block("ds_tabs")
     return _with_chars(result)
 
 
@@ -867,6 +990,7 @@ def ds_tab(identifier: str, prev_ok: str) -> str:
         identifier: Tab number from ds_tabs() (e.g., "3") or part of tab title (e.g., "gmail").
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     global _cdp_active_tab_id
     if not _is_cdp_available():
         return "CDP not available."
@@ -917,6 +1041,7 @@ def ds_navigate(url: str, prev_ok: str) -> str:
         url: Full URL including https:// (e.g., "https://example.com").
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     if not _is_cdp_available():
         return "CDP not available."
     ws = _cdp_ws()
@@ -926,7 +1051,7 @@ def ds_navigate(url: str, prev_ok: str) -> str:
     frame_id = result.get("result", {}).get("frameId", "")
     r = f"Navigated to {url}" if frame_id else f"Navigation sent to {url}"
     _log_action("ds_navigate", {"url": url}, r, prev_ok)
-    return r
+    return r + _tip_engine.get_tips_block("ds_navigate")
 
 
 @mcp.tool()
@@ -943,64 +1068,124 @@ def ds_mobile(prev_ok: str, enabled: bool = True) -> str:
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
         enabled: True to enable mobile emulation, False to disable and restore desktop.
     """
+    _require_ds()
     global _cdp_mobile_mode
     if not _is_cdp_available():
         return "CDP not available."
     ws = _cdp_ws()
+    _msg_id = 0
+    def _send(method: str, params: dict = None):
+        nonlocal _msg_id
+        _msg_id += 1
+        msg = {"id": _msg_id, "method": method}
+        if params:
+            msg["params"] = params
+        ws.send(json.dumps(msg))
+        return json.loads(ws.recv())
     if enabled:
-        # Set mobile viewport (iPhone 14 Pro dimensions)
-        ws.send(json.dumps({"id": 1, "method": "Emulation.setDeviceMetricsOverride", "params": {
-            "width": 375, "height": 812, "deviceScaleFactor": 3, "mobile": True
-        }}))
-        ws.recv()
-        # Set mobile User-Agent
+        # 1) Mobile viewport (iPhone 14 Pro)
+        _send("Emulation.setDeviceMetricsOverride", {
+            "width": 375, "height": 812, "deviceScaleFactor": 3, "mobile": True,
+            "screenWidth": 375, "screenHeight": 812,
+            "screenOrientation": {"type": "portraitPrimary", "angle": 0}
+        })
+        # 2) Touch emulation (makes CSS :hover → :active, enables touch events)
+        _send("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 5})
+        # 3) Mobile User-Agent (no metadata — CDP requires fields we can't fake cleanly)
         mobile_ua = (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
         )
-        ws.send(json.dumps({"id": 2, "method": "Network.setUserAgentOverride", "params": {
-            "userAgent": mobile_ua,
-            "platform": "iPhone",
-            "userAgentMetadata": {
-                "mobile": True, "platform": "iOS",
-                "brands": [{"brand": "Safari", "version": "17"}]
-            }
-        }}))
-        ws.recv()
+        _send("Network.setUserAgentOverride", {
+            "userAgent": mobile_ua, "platform": "iPhone"
+        })
+        # 4) Hard-reload so server sees mobile UA (ignoreCache=true skips disk cache)
+        _send("Page.reload", {"ignoreCache": True})
         _cdp_mobile_mode = True
         ws.close()
-        r = "Mobile emulation ON (375x812, iPhone UA). Reload/navigate to apply."
+        # Wait for page to settle after reload
+        time.sleep(2)
+        r = "Mobile emulation ON (375x812, touch, iPhone UA). Page hard-reloaded."
     else:
-        # Clear overrides — restore desktop
-        ws.send(json.dumps({"id": 1, "method": "Emulation.clearDeviceMetricsOverride"}))
-        ws.recv()
-        ws.send(json.dumps({"id": 2, "method": "Network.setUserAgentOverride", "params": {
-            "userAgent": ""
-        }}))
-        ws.recv()
+        # Clear overrides on ALL tabs — don't leave users in mobile
+        ws.close()  # close the single-tab ws from above
+        tabs = _cdp_tabs()
+        page_tabs = [t for t in tabs if t.get("type") == "page" and "webSocketDebuggerUrl" in t]
+        reset_count = 0
+        for tab in page_tabs:
+            tw = None
+            try:
+                import websocket as _ws_mod
+                tw = _ws_mod.create_connection(tab["webSocketDebuggerUrl"], timeout=3)
+                _tab_id = 0
+                def _tab_send(method: str, params: dict = None):
+                    nonlocal _tab_id
+                    _tab_id += 1
+                    msg = {"id": _tab_id, "method": method}
+                    if params:
+                        msg["params"] = params
+                    tw.send(json.dumps(msg))
+                    return json.loads(tw.recv())
+                _tab_send("Emulation.clearDeviceMetricsOverride")
+                _tab_send("Emulation.setTouchEmulationEnabled", {"enabled": False})
+                _tab_send("Network.setUserAgentOverride", {"userAgent": ""})
+                _tab_send("Page.reload", {"ignoreCache": True})
+                reset_count += 1
+            except Exception:
+                pass
+            finally:
+                if tw:
+                    try:
+                        tw.close()
+                    except Exception:
+                        pass
         _cdp_mobile_mode = False
-        ws.close()
-        r = "Mobile emulation OFF (desktop restored). Reload/navigate to apply."
+        time.sleep(2)
+        r = f"Mobile emulation OFF — {reset_count} tabs reset to desktop."
     _log_action("ds_mobile", {"enabled": enabled}, r, prev_ok)
     return r
 
 
 @mcp.tool()
-def ds_wait(prev_ok: str, seconds: float = 2.0) -> str:
+def ds_wait(prev_ok: str, seconds: float = 2.0, text: Optional[str] = None) -> str:
     """Wait for a browser page to finish loading (CDP/browser mode).
 
     Call this after ds_navigate() or ds_click() on a link before reading content.
     Waits for the DOM to reach 'complete' state, or falls back to a timed wait.
 
+    When `text` is provided, waits until that text appears anywhere on the page.
+    Much more reliable than time-based waiting — use it when you know what to expect.
+
     Args:
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
         seconds: Maximum seconds to wait (default 2.0, max 10.0).
+        text: Optional text to wait for. Polls page content until this string appears.
     """
+    _require_ds()
     seconds = min(seconds, 10.0)
     if not _is_cdp_available():
         time.sleep(seconds)
         return "waited (no CDP)"
     deadline = time.monotonic() + seconds
+    # Text-aware waiting: poll page body until target text appears
+    if text:
+        js_expr = "document.body ? document.body.innerText : ''"
+        while time.monotonic() < deadline:
+            try:
+                ws = _cdp_ws()
+                ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
+                    "expression": js_expr, "returnByValue": True
+                }}))
+                body = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", "")
+                ws.close()
+                if text.lower() in body.lower():
+                    elapsed = seconds - (deadline - time.monotonic())
+                    return f"found '{text}' after {elapsed:.1f}s"
+            except Exception:
+                pass
+            time.sleep(0.3)
+        return f"text '{text}' not found after {seconds}s"
+    # Default: wait for DOM complete
     while time.monotonic() < deadline:
         try:
             ws = _cdp_ws()
@@ -1031,6 +1216,7 @@ def ds_state(prev_ok: str, app: Optional[str] = None) -> str:
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
         app: Optional app name. If omitted, uses the currently snapped app.
     """
+    _require_ds()
     return _with_chars(_read_file(".a11y.snap", app))
 
 
@@ -1047,6 +1233,7 @@ def ds_screen(prev_ok: str, app: Optional[str] = None) -> str:
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
         app: Optional app name. If omitted, uses the currently snapped app.
     """
+    _require_ds()
     if _is_cdp_available():
         try:
             ws = _cdp_ws()
@@ -1057,10 +1244,12 @@ def ds_screen(prev_ok: str, app: Optional[str] = None) -> str:
             }}))
             text = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", "")
             ws.close()
-            return _with_chars(text.strip()) if text else "(empty page)"
+            r = _with_chars(text.strip()) if text else "(empty page)"
+            return r + _tip_engine.get_tips_block("ds_screen")
         except Exception:
             pass
-    return _with_chars(_read_file(".a11y", app))
+    r = _with_chars(_read_file(".a11y", app))
+    return r + _tip_engine.get_tips_block("ds_screen")
 
 
 @mcp.tool()
@@ -1076,8 +1265,10 @@ def ds_print(prev_ok: str) -> str:
     Args:
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     if not _is_cdp_available():
-        return "ds_print requires a browser with CDP (port 9222)."
+        port = _get_cdp_port()
+        return f"ds_print requires a browser with CDP (port {port})."
     try:
         ws = _cdp_ws()
         ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
@@ -1085,7 +1276,8 @@ def ds_print(prev_ok: str) -> str:
         }}))
         text = json.loads(ws.recv()).get("result", {}).get("result", {}).get("value", "")
         ws.close()
-        return _with_chars(text.strip()) if text else "(empty page)"
+        r = _with_chars(text.strip()) if text else "(empty page)"
+        return r + _tip_engine.get_tips_block("ds_print")
     except Exception as e:
         return f"CDP error: {e}"
 
@@ -1101,6 +1293,7 @@ def ds_elements(prev_ok: str, app: Optional[str] = None) -> str:
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
         app: Optional app name. If omitted, uses the currently snapped app.
     """
+    _require_ds()
     return _with_chars(_read_file(".snap", app))
 
 
@@ -1123,6 +1316,7 @@ def ds_query(sql: str, prev_ok: str, app: Optional[str] = None) -> list[dict]:
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
         app: Optional app name. If omitted, uses the currently snapped app.
     """
+    _require_ds()
     sql_lower = sql.strip().lower()
     if not sql_lower.startswith("select"):
         raise ValueError("Only SELECT queries are allowed. Use action tools to modify state.")
@@ -1143,14 +1337,8 @@ def ds_find(name_pattern: str, prev_ok: str, app: Optional[str] = None) -> list[
         name_pattern: Search pattern. Use % as wildcard.
         app: Optional app name. If omitted, uses the currently snapped app.
     """
-    return _db_query(
-        "SELECT id, role, name, value, automation_id, enabled, offscreen, "
-        "x, y, w, h FROM elements "
-        f"WHERE name LIKE ? AND enabled=1 AND offscreen=0 "
-        "ORDER BY y, x",
-        # Can't use parameterized query through our helper, so sanitize
-        app,
-    ) if False else _find_impl(name_pattern, app)
+    _require_ds()
+    return _find_impl(name_pattern, app)
 
 
 def _find_impl(pattern: str, app: Optional[str] = None) -> list[dict]:
@@ -1300,6 +1488,7 @@ def ds_events(prev_ok: str, app: Optional[str] = None, mark_consumed: bool = Tru
         app: Optional app name. If omitted, uses the currently snapped app.
         mark_consumed: If True (default), events won't appear again on next call.
     """
+    _require_ds()
     db_path = _get_db_path(app)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -1333,9 +1522,15 @@ def ds_click(element_name: str, prev_ok: str, app: Optional[str] = None) -> str:
         app: Optional app name (UIA mode only).
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     if _is_cdp_available():
-        _cdp_click(element_name)
-        r = f"ok cdp{_learning_hint()}"
+        try:
+            _cdp_click(element_name)
+            r = f"ok cdp{_learning_hint()}"
+        except Exception:
+            # CDP can't find it (e.g. cross-origin iframe) — fall back to UIA
+            action_id = _inject_action("click", target=element_name, app=app)
+            r = f"ok uia-fallback #{action_id}{_learning_hint()}"
     else:
         action_id = _inject_action("click", target=element_name, app=app)
         r = f"ok #{action_id}{_learning_hint()}"
@@ -1357,6 +1552,7 @@ def ds_text(value: str, target: str, prev_ok: str, app: Optional[str] = None) ->
         app: Optional app name (UIA mode only).
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     if _is_cdp_available():
         _cdp_type(value, target)
         r = f"ok cdp{_learning_hint()}"
@@ -1380,6 +1576,7 @@ def ds_type(text: str, prev_ok: str, app: Optional[str] = None) -> str:
         app: Optional app name (UIA mode only).
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     _log_action("ds_type", {"text": text}, "", prev_ok)
     text = text.replace("\\t", "\t").replace("\\n", "\n").replace("\\r", "\r")
     if _is_cdp_available():
@@ -1401,6 +1598,7 @@ def ds_key(combo: str, prev_ok: str, app: Optional[str] = None) -> str:
         app: Optional app name (UIA mode only).
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     if _is_cdp_available():
         _cdp_key(combo)
         r = f"ok cdp{_learning_hint()}"
@@ -1423,6 +1621,7 @@ def ds_scroll(direction: str, prev_ok: str, amount: int = 1, app: Optional[str] 
         app: Optional app name (UIA mode only).
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     if direction not in ("up", "down", "left", "right"):
         raise ValueError(f"Invalid direction: {direction}. Use up/down/left/right.")
     if _is_cdp_available():
@@ -1452,6 +1651,7 @@ def ds_batch(actions: list[dict], prev_ok: str, app: Optional[str] = None) -> st
         app: Optional app name (UIA mode only).
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     if _is_cdp_available():
         for act in actions:
             a = act.get("action", "click")
@@ -1493,6 +1693,7 @@ def ds_profile_list(prev_ok: str) -> dict:
     Args:
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     # Known apps from .db files
     known_apps = sorted(set(p.stem for p in PROFILES_DIR.glob("*.db")))
 
@@ -1544,6 +1745,7 @@ def ds_profile_save(
     Returns:
         Confirmation.
     """
+    _require_ds()
     profiles = _load_profiles()
     profiles[app] = {
         "description": description,
@@ -1567,6 +1769,7 @@ def ds_profile_get(app: str, prev_ok: str) -> dict:
     Args:
         app: Application name.
     """
+    _require_ds()
     profiles = _load_profiles()
     if app not in profiles:
         return {"app": app, "status": "no_profile", "hint": "Use ds_profile_save to create one."}
@@ -1580,9 +1783,6 @@ def ds_profile_get(app: str, prev_ok: str) -> dict:
 # In-memory store for active tools
 _active_view = {"screen": "", "tools": [], "data": "", "raw_tools": []}
 _cdp_labels: set = set()  # CDP element labels from last update_view
-
-
-# NOTE: Gemini translator path removed — ds_update_view is now fully deterministic (no LLM).
 
 
 def _cdp_extract() -> dict:
@@ -1800,12 +2000,21 @@ def ds_update_view(prev_ok: str, app: Optional[str] = None) -> str:
         app: Optional app name (UIA mode only).
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _require_ds()
     _log_action("ds_update_view", {}, "", prev_ok)
     global _active_view, _cdp_labels, _cdp_tool_map
 
     # --- Deterministic CDP path (only for browser apps) ---
     cdp = None
     if _is_cdp_available():
+        # Update tip engine with current tab URL for context-aware tips
+        try:
+            tabs = _cdp_tabs()
+            active = next((t for t in tabs if t.get("id") == _cdp_active_tab_id), None)
+            if active and active.get("url"):
+                _tip_engine.update_context("_url_sync", {"url": active["url"]}, "", "yes")
+        except Exception:
+            pass
         try:
             cdp = _cdp_extract()
         except Exception:
@@ -1821,6 +2030,7 @@ def ds_update_view(prev_ok: str, app: Optional[str] = None) -> str:
             tool_lines.append(f"[{i}] {t['action']}|{t['element']}")
 
         result = cdp["text"] + "\n---\n" + "\n".join(tool_lines)
+        result += _tip_engine.get_tips_block("ds_update_view")
         return _with_chars(result)
 
     # --- Fallback: UIA a11y (native apps without CDP) ---
@@ -1835,7 +2045,7 @@ def ds_update_view(prev_ok: str, app: Optional[str] = None) -> str:
             continue
         if '"' in line:
             name = line.split('"')[1]
-            action = "type" if line.startswith("[keyboard]") else "click"
+            action = "type" if "[keyboard]" in line else "click"
             tools.append({"action": action, "element": name, "description": ""})
 
     _active_view = {"screen": a11y, "tools": tools, "data": ""}
@@ -1859,40 +2069,8 @@ def ds_update_view(prev_ok: str, app: Optional[str] = None) -> str:
             content += line.strip() + "\n"
 
     result = (content.strip() or "(no text)") + "\n---\n" + "\n".join(tool_lines)
+    result += _tip_engine.get_tips_block("ds_update_view")
     return _with_chars(result)
-
-
-    # --- OLD: Gemini translator path (kept for reference) ---
-    # raw_response = _call_translator(a11y, snap)
-    # parsed = _parse_translator_response(raw_response)
-    # _active_view = {"screen": parsed["screen"], "tools": parsed["tools"], "data": parsed["data"]}
-    # tool_lines = []
-    # for i, t in enumerate(parsed["tools"], 1):
-    #     tool_lines.append(f"  [{i}] {t['action']}|{t['element']}| {t['description']}")
-    # app_name = app or _get_snapped_app()
-    # learnings_dir = PROFILES_DIR / "learnings"
-    # available_learnings = []
-    # if learnings_dir.is_dir() and app_name:
-    #     prefix = app_name.lower() + "_"
-    #     for f in sorted(learnings_dir.glob(f"{prefix}*.md")):
-    #         context = f.stem[len(prefix):]
-    #         available_learnings.append(context)
-    # result = {
-    #     "screen": parsed["screen"],
-    #     "tools": "\n".join(tool_lines),
-    #     "tool_count": len(parsed["tools"]),
-    #     "data": parsed["data"],
-    # }
-    # if available_learnings:
-    #     result["learnings"] = available_learnings
-    #     result["learnings_hint"] = f"Read learnings BEFORE acting: ds_learn('{app_name}', '<context>')"
-    # else:
-    #     result["learnings"] = []
-    #     result["learnings_hint"] = (
-    #         f"No learnings yet for '{app_name}'. After completing actions, "
-    #         f"save what you learned: ds_learn('{app_name}', '<context>', append='your insight here')"
-    #     )
-    # return result
 
 
 @mcp.tool()
@@ -1907,6 +2085,7 @@ def ds_learn(app: str, context: str, prev_ok: str, append: Optional[str] = None)
         context: Topic (e.g., "general", "input", "navigation").
         append: Text to save. Omit to read existing learnings.
     """
+    _require_ds()
     learnings_dir = PROFILES_DIR / "learnings"
     learnings_dir.mkdir(parents=True, exist_ok=True)
     filepath = learnings_dir / f"{app.lower()}_{context.lower()}.md"
@@ -1914,6 +2093,11 @@ def ds_learn(app: str, context: str, prev_ok: str, append: Optional[str] = None)
     if append:
         with open(filepath, "a", encoding="utf-8") as f:
             f.write(f"\n{append}\n")
+        # Auto-index into tip engine for automatic injection
+        try:
+            _tip_engine.ingest_learning(app, context, append)
+        except Exception:
+            pass
 
     if filepath.exists():
         content = filepath.read_text(encoding="utf-8")
@@ -1924,7 +2108,7 @@ def ds_learn(app: str, context: str, prev_ok: str, append: Optional[str] = None)
 
 
 @mcp.tool()
-def ds_act(tool_number: int, prev_ok: str, text: Optional[str] = None, app: Optional[str] = None) -> str:
+def ds_act(tool_number: int, prev_ok: str, text: Optional[str] = None, app: Optional[str] = None, include_view: bool = False) -> str:
     """Execute a numbered tool from ds_update_view() output.
 
     ds_update_view() returns tools like: [1] click|Submit  [2] type|Search
@@ -1932,12 +2116,16 @@ def ds_act(tool_number: int, prev_ok: str, text: Optional[str] = None, app: Opti
 
     IMPORTANT: Always call ds_update_view() first — ds_act only works with the latest tool list.
 
+    Set include_view=true to get the updated page view in the same response (saves a round-trip).
+
     Args:
         tool_number: The tool number (1-based) from ds_update_view output.
         text: Text to type (required when the tool is a 'type' action, ignored for 'click').
         app: Optional app name (UIA mode only).
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
+        include_view: If true, automatically reads the updated view after the action and appends it.
     """
+    _require_ds()
     if not _active_view["tools"]:
         raise ValueError("No active tools. Call ds_update_view() first.")
 
@@ -1966,6 +2154,11 @@ def ds_act(tool_number: int, prev_ok: str, text: Optional[str] = None, app: Opti
             action_id = _inject_action("click", target=element, app=app)
             r = f"ok #{action_id}{_learning_hint()}"
     _log_action("ds_act", {"tool_number": tool_number, "element": element, "action": action_type, "text": text}, r, prev_ok)
+    # Optionally append fresh view — saves a ds_update_view() round-trip
+    if include_view:
+        time.sleep(0.3)  # brief settle after action
+        view = ds_update_view(prev_ok="yes", app=app)
+        r += "\n\n--- Updated View ---\n" + view
     return r
 
 

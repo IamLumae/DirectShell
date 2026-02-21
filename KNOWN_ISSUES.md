@@ -81,6 +81,47 @@ Make sure you install it for the same Python version your MCP client uses. Some 
 
 ---
 
+### MCP server burns CPU on Windows (anyio stdin busy-polling)
+
+**Symptom:** The `server.py` MCP process consumes ~5% system CPU (or 95% of one core) even when idle. Visible in Task Manager as a Python process with high CPU time.
+
+**Cause:** The FastMCP framework uses `anyio.wrap_file(sys.stdin)` internally for JSON-RPC communication. On Windows, this spawns a background thread that busy-polls stdin because Windows doesn't support async file I/O on pipes the way Unix does. When the parent process disconnects (e.g., MCP client restarts), the polling thread spins on a broken pipe.
+
+**Impact:** Wastes CPU permanently. On a system with multiple MCP servers running, this adds up.
+
+**Status:** Open. An attempted fix (wrapping stdin with a custom `GuardedStdin` class) broke MCP communication entirely and was reverted. The root cause is in `anyio`'s Windows implementation, not in DirectShell.
+
+**Contributor hint:** This likely needs a fix upstream in `anyio` or a workaround at the FastMCP level. Possible approaches:
+- Patch `anyio`'s `wrap_file` to use a non-busy wait on Windows pipes
+- Use a custom stdio transport that avoids `anyio.wrap_file` entirely
+- Add a stdin health-check thread that exits the process when the pipe breaks
+
+---
+
+### Unicode emoji/surrogate pairs silently truncated in keyboard input
+
+**Symptom:** Characters above U+FFFF (emoji like `U+1F600`, rare CJK extension characters) are silently dropped or corrupted when typed via `ds_type()` or the keyboard hook.
+
+**Cause:** `inject_char()` in `main.rs` casts `char` to `u16` directly (`ch as u16`), which truncates any codepoint that requires a UTF-16 surrogate pair (two `u16` values). The `KEYBDINPUT` struct expects UTF-16 code units, not Unicode codepoints.
+
+**Fix needed:** Encode the character as UTF-16 (`char::encode_utf16`) and send two `KEYBDINPUT` events (high surrogate + low surrogate) for characters above U+FFFF.
+
+**Impact:** Low — most UI automation involves ASCII/Latin text. Affects emoji input and some CJK characters.
+
+---
+
+### `RemoveAllEventHandlers()` background thread has no timeout
+
+**Symptom:** On rare occasions, unsnapping from a hung or crashed application causes a background thread to hang indefinitely.
+
+**Cause:** When unsnapping, `unregister_event_handlers()` spawns a thread that calls `IUIAutomation::RemoveAllEventHandlers()`. This COM call can block indefinitely if the target application's process is in a broken state (deadlocked, zombie).
+
+**Impact:** The leaked thread consumes minimal resources but is never cleaned up. In normal operation (healthy target apps) the call completes in <1 second.
+
+**Contributor hint:** Add a watchdog — if the thread doesn't complete within 5 seconds, log a warning and move on. The leaked UIA instance will be cleaned up on process exit.
+
+---
+
 ### Chromium apps need a few seconds after snapping
 
 **Symptom:** Snapping to Chrome, Edge, Discord, VS Code, or other Chromium-based apps shows an incomplete or empty tree initially.

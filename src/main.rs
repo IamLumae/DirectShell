@@ -11,23 +11,19 @@
 #![windows_subsystem = "windows"]
 
 use std::ffi::c_void;
-use std::fs::{self, OpenOptions};
-use std::io::Write as IoWrite;
+use std::fs;
 use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering::SeqCst};
 use std::sync::{Mutex, OnceLock};
-use std::net::TcpStream;
-use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, params};
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::*;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetModuleFileNameW};
 use windows::Win32::UI::Accessibility::*;
 use windows::Win32::System::Threading::{
-    GetCurrentThreadId, AttachThreadInput,
     OpenProcess, QueryFullProcessImageNameW,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_FORMAT,
 };
@@ -73,26 +69,42 @@ const MAX_CHILDREN: i32 = i32::MAX; // Primitivum. Kein Limit.
 const STREAM_BATCH: i32 = 200;    // COMMIT alle 200 Elemente → progressive Verfügbarkeit
 const DB_DIR: &str = "ds_profiles";  // Persistente App-DBs
 const ACTIVE_FILE: &str = "ds_profiles/is_active";  // Status für KI-Agents
-const LOG_FILE: &str = "directshell.log";
+const LOG_FILE: &str = "ds_profiles/directshell.log";      // Log neben den Profilen
 const WINDOWS_FILE: &str = "ds_profiles/windows.json";       // Daemon: alle offenen Fenster
 const SNAP_REQUEST_FILE: &str = "ds_profiles/snap_request";   // AI → DS: "snap to this app"
 const SNAP_RESULT_FILE: &str = "ds_profiles/snap_result";     // DS → AI: result JSON
+const OVERLAY_MODE_FILE: &str = "ds_profiles/overlay_mode";    // AI → DS: "agent" or "human"
+const WM_TRAYICON: u32 = 0x0400 + 50;  // WM_APP + 50 — custom tray callback
+const TRAY_ID: u32 = 1;
+const IDM_TOGGLE_MODE: u16 = 1001;
+const IDM_EXIT: u16 = 1002;
 
-// ── Logging ────────────────────────────────────────
+// ── Logging (Ring-Buffer im RAM, Flush auf Disk) ────
+use std::collections::VecDeque;
+static LOG_BUF: Mutex<Option<VecDeque<String>>> = Mutex::new(None);
+const LOG_MAX: usize = 100;
+
 fn log(msg: &str) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let secs = ts.as_secs();
     let millis = ts.subsec_millis();
-    // HH:MM:SS.mmm (UTC, but good enough for debugging)
     let h = (secs / 3600) % 24;
     let m = (secs / 60) % 60;
     let s = secs % 60;
-    let line = format!("[{:02}:{:02}:{:02}.{:03}] {}\n", h, m, s, millis, msg);
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(LOG_FILE) {
-        let _ = IoWrite::write_all(&mut f, line.as_bytes());
+    let line = format!("[{:02}:{:02}:{:02}.{:03}] {}", h, m, s, millis, msg);
+
+    let mut guard = LOG_BUF.lock().unwrap();
+    let buf = guard.get_or_insert_with(|| VecDeque::with_capacity(LOG_MAX + 1));
+    buf.push_back(line);
+    while buf.len() > LOG_MAX {
+        buf.pop_front();
     }
+    // Flush to disk
+    let content: String = buf.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n") + "\n";
+    drop(guard); // Release lock before IO
+    let _ = fs::write(LOG_FILE, content);
 }
 
 // ── Globaler State ──────────────────────────────────
@@ -102,6 +114,7 @@ static TREE_BUSY: AtomicBool = AtomicBool::new(false);
 static CURRENT_DB: Mutex<String> = Mutex::new(String::new());
 static KB_HOOK: AtomicIsize = AtomicIsize::new(0);
 static EVENT_UIA_PTR: AtomicIsize = AtomicIsize::new(0);      // UIA instance for event handlers (cleanup on unsnap)
+static A11Y_UIA_PTR: AtomicIsize = AtomicIsize::new(0);       // UIA instance from activate_accessibility (reused across snaps)
 static LAST_EVENT_DUMP_MS: AtomicIsize = AtomicIsize::new(0);  // Debounce: last event-triggered dump timestamp
 static LAST_X: AtomicI32 = AtomicI32::new(0);
 static LAST_Y: AtomicI32 = AtomicI32::new(0);
@@ -112,8 +125,10 @@ static DYN_TOP_H: AtomicI32 = AtomicI32::new(DEFAULT_TOP_H);
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 static DS_HWND: AtomicIsize = AtomicIsize::new(0);           // Daemon: eigenes Fenster-Handle
 static DAEMON_SNAP: AtomicBool = AtomicBool::new(false);     // Daemon: skip CDP popup
+static AGENT_MODE: AtomicBool = AtomicBool::new(false);      // Agent mode: overlay hidden
 static LAST_CLICK_X: AtomicI32 = AtomicI32::new(-1);        // Auto-persist: last click X (absolute screen)
 static LAST_CLICK_Y: AtomicI32 = AtomicI32::new(-1);        // Auto-persist: last click Y (absolute screen)
+static LAST_PROC_CHECK: AtomicIsize = AtomicIsize::new(0);   // Throttle: last process-alive check (ms since start)
 
 fn tgt() -> HWND { HWND(TARGET_HW.load(SeqCst) as *mut _) }
 fn snapped() -> bool { IS_SNAPPED.load(SeqCst) }
@@ -572,8 +587,9 @@ fn dump_tree() {
 
                 let total_ms = t0.elapsed().as_millis();
                 log(&format!("dump: {} rows streamed, total={}ms", ctx.count, total_ms));
+
                 generate_snap(&db_path);
-                generate_a11y(&db_path, target);
+                generate_a11y(&db_path);
                 generate_a11y_snap(&db_path);
                 write_active_status(&db_path);
             }
@@ -582,6 +598,33 @@ fn dump_tree() {
         }
         TREE_BUSY.store(false, SeqCst);
     });
+}
+
+// ── Global WinEvent Hook — DS als Screen Reader sichtbar ──
+// NVDA wird von Browsern erkannt weil es SetWinEventHook nutzt.
+// Chrome probt: NotifyWinEvent(EVENT_SYSTEM_ALERT, hwnd, 1, 0)
+// Wenn IRGENDWER einen WinEvent Hook hat und AccessibleObjectFromWindow
+// zurückruft, sagt Chrome: "AT aktiv → Accessibility AN".
+// DS macht genau das — global, für ALLE Fenster, inkl. Popups.
+unsafe extern "system" fn global_winevent_proc(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _event_thread: u32,
+    _event_time: u32,
+) {
+    // Nur auf gültige Fenster reagieren
+    if hwnd.0.is_null() || !IsWindow(hwnd).as_bool() { return; }
+    // AccessibleObjectFromWindow zurückrufen — DAS ist was Chrome als AT-Präsenz erkennt
+    let mut acc: *mut c_void = std::ptr::null_mut();
+    let _ = AccessibleObjectFromWindow(
+        hwnd,
+        id_object as u32,
+        &IAccessible::IID,
+        &mut acc,
+    );
 }
 
 // ── Chromium Accessibility Trigger ───────────────────
@@ -614,14 +657,19 @@ unsafe fn activate_accessibility(target: HWND) {
     // ── Phase 2: UIA Event Handler registrieren ──
     // DAS ist der Schlüssel: UiaClientsAreListening() wird true
     // Chromium checkt das und aktiviert Accessibility für alle Renderer
-    if let Ok(uia) = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) {
-        // FocusChanged Handler auf Root — leichtgewichtig, signalisiert AT-Präsenz
-        let handler: IUIAutomationFocusChangedEventHandler = UiaFocusHandler.into();
-        let _ = uia.AddFocusChangedEventHandler(None, &handler);
-        log("activate_a11y: UIA FocusChanged handler registered → UiaClientsAreListening() = true");
-
-        // UIA Instanz + Handler am Leben halten (Leak = nie deregistriert)
-        let _ = Box::leak(Box::new(uia));
+    // Reuse existing UIA instance across snaps to avoid memory leaks
+    let existing = A11Y_UIA_PTR.load(SeqCst);
+    if existing == 0 {
+        if let Ok(uia) = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) {
+            let handler: IUIAutomationFocusChangedEventHandler = UiaFocusHandler.into();
+            let _ = uia.AddFocusChangedEventHandler(None, &handler);
+            log("activate_a11y: UIA FocusChanged handler registered → UiaClientsAreListening() = true");
+            // Store raw pointer — one instance for the lifetime of the process
+            let raw = Box::into_raw(Box::new(uia));
+            A11Y_UIA_PTR.store(raw as isize, SeqCst);
+        }
+    } else {
+        log("activate_a11y: reusing existing UIA instance");
     }
 
     // Kurz warten damit Chromium die Signale verarbeiten kann
@@ -673,20 +721,41 @@ impl IUIAutomationFocusChangedEventHandler_Impl for UiaFocusHandler_Impl {
 // Drei Handler: Automation Events, Property Changes, Structure Changes
 // Events → SQLite `events` Tabelle → MCP liest nur Deltas
 
+/// Cached event DB connection — avoids Connection::open per event.
+static EVENT_DB: Mutex<Option<(String, Connection)>> = Mutex::new(None);
+
 /// Write a single event row to the events table.
 fn write_event(event_type: &str, elem_name: &str, elem_role: &str, detail: &str, new_val: &str) {
     let db_path = get_db_path();
     if db_path.is_empty() { return; }
-    if let Ok(conn) = Connection::open(&db_path) {
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
-        // Ensure events table exists (init_db might not have created it for pre-existing DBs)
-        let _ = conn.execute_batch("
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL,
-                event_type TEXT NOT NULL, element_name TEXT, element_role TEXT,
-                detail TEXT, new_value TEXT, consumed INTEGER DEFAULT 0
-            );
-        ");
+
+    let mut guard = match EVENT_DB.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+
+    // Re-open connection if db path changed (new snap target) or not yet opened
+    let needs_open = match &*guard {
+        Some((cached_path, _)) => cached_path != &db_path,
+        None => true,
+    };
+    if needs_open {
+        if let Ok(conn) = Connection::open(&db_path) {
+            let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=100;");
+            let _ = conn.execute_batch("
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL,
+                    event_type TEXT NOT NULL, element_name TEXT, element_role TEXT,
+                    detail TEXT, new_value TEXT, consumed INTEGER DEFAULT 0
+                );
+            ");
+            *guard = Some((db_path.clone(), conn));
+        } else {
+            return;
+        }
+    }
+
+    if let Some((_, conn)) = &*guard {
         let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         let _ = conn.execute(
             "INSERT INTO events(timestamp,event_type,element_name,element_role,detail,new_value) \
@@ -883,12 +952,21 @@ unsafe fn register_event_handlers(target: HWND) {
 unsafe fn unregister_event_handlers() {
     let ptr = EVENT_UIA_PTR.swap(0, SeqCst);
     if ptr != 0 {
-        let uia = Box::from_raw(ptr as *mut IUIAutomation);
-        match uia.RemoveAllEventHandlers() {
-            Ok(_) => log("unregister_events: all handlers removed"),
-            Err(e) => log(&format!("unregister_events: FAIL: {e}")),
-        }
-        // uia drops here → COM Release
+        // RemoveAllEventHandlers() is a synchronous COM call that can block for
+        // 10+ seconds if the target app is slow or hung. Running it on the
+        // message-loop thread freezes the entire overlay. Spawn a background
+        // thread so unsnap completes instantly and the UI stays responsive.
+        std::thread::spawn(move || {
+            // COM needs per-thread init
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let uia = Box::from_raw(ptr as *mut IUIAutomation);
+            match uia.RemoveAllEventHandlers() {
+                Ok(_) => log("unregister_events: all handlers removed"),
+                Err(e) => log(&format!("unregister_events: FAIL: {e}")),
+            }
+            CoUninitialize();
+            // uia drops here → COM Release
+        });
     }
 }
 
@@ -973,7 +1051,7 @@ fn generate_snap(db_path: &str) {
 
 /// Generate .a11y file — DB-based. Only GetFocusedElement() is live UIA.
 /// Everything else comes from the SQLite dump that just ran.
-fn generate_a11y(db_path: &str, _target: HWND) {
+fn generate_a11y(db_path: &str) {
     let a11y_path = db_path.replace(".db", ".a11y");
 
     let conn = match Connection::open(db_path) {
@@ -1243,15 +1321,12 @@ unsafe fn inject_text(target: HWND, text: &str, target_name: &str) -> bool {
         }
     }
 
-    // Strategy 2: SendInput to the now-focused element
+    // Strategy 2: SendInput — focus target first, then type
     log("inject: ValuePattern failed, using SendInput");
-    let our_tid = GetCurrentThreadId();
-    let target_tid = GetWindowThreadProcessId(target, None);
-    let _ = AttachThreadInput(our_tid, target_tid, TRUE);
+    let _ = SetForegroundWindow(target);
     for ch in text.chars() {
         inject_char(ch);
     }
-    let _ = AttachThreadInput(our_tid, target_tid, FALSE);
     log("inject: SendInput done");
     true
 }
@@ -1490,17 +1565,20 @@ unsafe fn click_element(target_hwnd: HWND, element_name: &str) -> bool {
     };
     let cx = rect.left + (rect.right - rect.left) / 2;
     let cy = rect.top + (rect.bottom - rect.top) / 2;
-    let screen_w = GetSystemMetrics(SM_CXSCREEN);
-    let screen_h = GetSystemMetrics(SM_CYSCREEN);
-    let abs_x = (cx as i32 * 65535 / screen_w) as i32;
-    let abs_y = (cy as i32 * 65535 / screen_h) as i32;
+    let screen_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    let screen_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    let screen_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    let screen_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    let abs_x = ((cx - screen_x) * 65535 / screen_w) as i32;
+    let abs_y = ((cy - screen_y) * 65535 / screen_h) as i32;
+    let vd_flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
     let inputs = [
         INPUT {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 {
                 mi: MOUSEINPUT {
                     dx: abs_x, dy: abs_y, mouseData: 0,
-                    dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN,
+                    dwFlags: vd_flags | MOUSEEVENTF_LEFTDOWN,
                     time: 0, dwExtraInfo: 0,
                 },
             },
@@ -1510,7 +1588,7 @@ unsafe fn click_element(target_hwnd: HWND, element_name: &str) -> bool {
             Anonymous: INPUT_0 {
                 mi: MOUSEINPUT {
                     dx: abs_x, dy: abs_y, mouseData: 0,
-                    dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP,
+                    dwFlags: vd_flags | MOUSEEVENTF_LEFTUP,
                     time: 0, dwExtraInfo: 0,
                 },
             },
@@ -1540,10 +1618,13 @@ unsafe fn scroll_window(target_hwnd: HWND, direction: &str) {
     let cx = rect.left + (rect.right - rect.left) / 2;
     let cy = rect.top + (rect.bottom - rect.top) / 2;
 
-    let screen_w = GetSystemMetrics(SM_CXSCREEN);
-    let screen_h = GetSystemMetrics(SM_CYSCREEN);
-    let abs_x = (cx * 65535 / screen_w) as i32;
-    let abs_y = (cy * 65535 / screen_h) as i32;
+    let screen_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    let screen_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    let screen_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    let screen_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    let abs_x = ((cx - screen_x) * 65535 / screen_w) as i32;
+    let abs_y = ((cy - screen_y) * 65535 / screen_h) as i32;
+    let vd_flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
 
     if dy != 0 {
         let input = [INPUT {
@@ -1552,7 +1633,7 @@ unsafe fn scroll_window(target_hwnd: HWND, direction: &str) {
                 mi: MOUSEINPUT {
                     dx: abs_x, dy: abs_y,
                     mouseData: dy as u32,
-                    dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_WHEEL,
+                    dwFlags: vd_flags | MOUSEEVENTF_WHEEL,
                     time: 0, dwExtraInfo: 0,
                 },
             },
@@ -1566,7 +1647,7 @@ unsafe fn scroll_window(target_hwnd: HWND, direction: &str) {
                 mi: MOUSEINPUT {
                     dx: abs_x, dy: abs_y,
                     mouseData: dx as u32,
-                    dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_HWHEEL,
+                    dwFlags: vd_flags | MOUSEEVENTF_HWHEEL,
                     time: 0, dwExtraInfo: 0,
                 },
             },
@@ -1604,17 +1685,8 @@ fn process_injections() {
         .ok();
 
     if let Some((id, action, text, target_name)) = row {
-        // Claim IMMEDIATELY — retry up to 3 times if DB is locked.
-        let mut claimed = false;
-        for _ in 0..3 {
-            if conn.execute("UPDATE inject SET done=1 WHERE id=?1", params![id]).is_ok() {
-                claimed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        if !claimed {
-            log(&format!("action: FAILED to claim id={} — skipping", id));
+        // Claim action — if DB is locked, bail out and retry next timer tick (30ms)
+        if conn.execute("UPDATE inject SET done=1 WHERE id=?1", params![id]).is_err() {
             BUSY.store(false, SeqCst);
             return;
         }
@@ -1640,9 +1712,10 @@ fn process_injections() {
                         if lx >= 0 && ly >= 0 {
                             let _ = SetForegroundWindow(target);
                             std::thread::sleep(std::time::Duration::from_millis(30));
+                            let vdf = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
                             let refocus = [
-                                INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: lx, dy: ly, mouseData: 0, dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN, time: 0, dwExtraInfo: 0 } } },
-                                INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: lx, dy: ly, mouseData: 0, dwFlags: MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTUP, time: 0, dwExtraInfo: 0 } } },
+                                INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: lx, dy: ly, mouseData: 0, dwFlags: vdf | MOUSEEVENTF_LEFTDOWN, time: 0, dwExtraInfo: 0 } } },
+                                INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: lx, dy: ly, mouseData: 0, dwFlags: vdf | MOUSEEVENTF_LEFTUP, time: 0, dwExtraInfo: 0 } } },
                             ];
                             SendInput(&refocus, mem::size_of::<INPUT>() as i32);
                             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1706,11 +1779,6 @@ fn process_injections() {
 }
 
 // ── Keyboard Hook (Input Proxy) ─────────────────────
-
-/// Identity transform (POC uppercase removed)
-fn transform_char(ch: char) -> char {
-    ch
-}
 
 /// Inject a single Unicode character into the focused window via SendInput
 unsafe fn inject_char(ch: char) {
@@ -1806,7 +1874,8 @@ unsafe extern "system" fn kb_hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRE
 
     // Try converting virtual key → Unicode character
     let mut buf = [0u16; 4];
-    let n = ToUnicode(vk, kbd.scanCode, Some(&kb_state), &mut buf, 0);
+    // Flag 0x4 = do not modify keyboard state (preserve dead keys like ^ ´ `)
+    let n = ToUnicode(vk, kbd.scanCode, Some(&kb_state), &mut buf, 0x4);
 
     // n <= 0 = dead key or no translation → pass through
     if n <= 0 {
@@ -1817,8 +1886,7 @@ unsafe extern "system" fn kb_hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRE
     if msg == WM_KEYDOWN {
         for i in 0..n as usize {
             if let Some(ch) = char::from_u32(buf[i] as u32) {
-                let out = transform_char(ch);
-                inject_char(out);
+                inject_char(ch);
             }
         }
     }
@@ -1845,95 +1913,8 @@ unsafe fn find_snap(me: HWND) -> Option<HWND> {
 }
 
 // ── Snap / Unsnap ───────────────────────────────────
-/// Check if target is a browser and CDP is available.
-/// Returns true = proceed with snap. Returns false = snap aborted (browser relaunching).
-unsafe fn ensure_cdp(target: HWND) -> bool {
-    // Daemon mode: skip CDP popup entirely — no user interaction
-    if DAEMON_SNAP.load(SeqCst) {
-        log("ensure_cdp: DAEMON mode — skipping CDP check");
-        return true;
-    }
-
-    let mut buf = [0u16; 256];
-    let len = GetWindowTextW(target, &mut buf);
-    let title = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
-
-    // Detect browser by window title
-    let is_browser = title.contains("chrome") || title.contains("opera")
-        || title.contains("firefox") || title.contains("edge");
-    if !is_browser { return true; } // Not a browser, snap normally
-
-    // Try connecting to CDP
-    if TcpStream::connect_timeout(
-        &"127.0.0.1:9222".parse().unwrap(),
-        Duration::from_millis(200),
-    ).is_ok() {
-        log("cdp: already active on :9222");
-        return true;
-    }
-
-    // Get EXE path BEFORE showing popup (process is still alive)
-    let mut pid: u32 = 0;
-    GetWindowThreadProcessId(target, Some(&mut pid));
-    let mut exe_path = String::new();
-    if pid != 0 {
-        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-        use windows::Win32::System::ProcessStatus::GetModuleFileNameExW;
-        if let Ok(hproc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) {
-            let mut path_buf = [0u16; 512];
-            let plen = GetModuleFileNameExW(hproc, None, &mut path_buf);
-            if plen > 0 {
-                exe_path = String::from_utf16_lossy(&path_buf[..plen as usize]);
-            }
-            let _ = windows::Win32::Foundation::CloseHandle(hproc);
-        }
-    }
-    if exe_path.is_empty() {
-        log("cdp: could not determine browser exe path, skipping CDP");
-        return true; // Can't fix it, snap anyway
-    }
-
-    log(&format!("cdp: not active, asking user to close browser ({})", exe_path));
-
-    // Free-floating MessageBox (HWND(0) = no parent, not modal to the browser)
-    let msg = "DirectShell needs Chrome DevTools Protocol for full page access.\n\n\
-               Close your browser, then click OK.\n\
-               DirectShell will restart it with CDP enabled.\n\n\
-               (You can then snap again.)";
-    let msg_w: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-    let title_w: Vec<u16> = "DirectShell \u{2014} CDP Setup".encode_utf16().chain(std::iter::once(0)).collect();
-
-    MessageBoxW(
-        HWND(std::ptr::null_mut()),
-        PCWSTR(msg_w.as_ptr()),
-        PCWSTR(title_w.as_ptr()),
-        MB_OK | MB_ICONINFORMATION,
-    );
-
-    // Wait for browser to actually close (up to 15 sec)
-    for _ in 0..30 {
-        if !IsWindow(target).as_bool() { break; }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
-    // Relaunch with CDP
-    log(&format!("cdp: launching {} with --remote-debugging-port=9222", exe_path));
-    let _ = Command::new(&exe_path)
-        .arg("--remote-debugging-port=9222")
-        .arg("--remote-allow-origins=*")
-        .spawn();
-
-    false // Don't snap — browser is restarting, user snaps again
-}
-
 unsafe fn do_snap(me: HWND, target: HWND) {
     log(&format!("do_snap: me=0x{:X} target=0x{:X}", me.0 as usize, target.0 as usize));
-
-    // CDP: If target is a browser without CDP, bounce the snap
-    if !ensure_cdp(target) {
-        log("do_snap: ABORTED — CDP setup in progress, user snaps again after browser restart");
-        return;
-    }
 
     let mut rc = RECT::default();
     let _ = GetWindowRect(target, &mut rc);
@@ -2002,6 +1983,56 @@ unsafe fn do_unsnap(me: HWND) {
     let _ = InvalidateRect(me, None, TRUE);
 }
 
+/// JSON-escape a string (handles backslash, quotes, and control characters)
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"'  => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c < '\x20' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Info about a visible top-level window
+struct WindowInfo {
+    hwnd: HWND,
+    raw: isize,
+    title: String,
+    app: String,
+    pid: u32,
+}
+
+/// Enumerate all visible top-level windows (excluding DS itself and shell windows)
+unsafe fn get_visible_windows() -> Vec<WindowInfo> {
+    let ds = HWND(DS_HWND.load(SeqCst) as *mut _);
+    let hwnds = collect_windows();
+    let mut result = Vec::new();
+    for &raw in &hwnds {
+        let hwnd = HWND(raw as *mut _);
+        if !IsWindowVisible(hwnd).as_bool() { continue; }
+        if !ds.0.is_null() && hwnd == ds { continue; }
+        if is_shell(hwnd) { continue; }
+        let mut buf = [0u16; 256];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        if len == 0 { continue; }
+        let title = String::from_utf16_lossy(&buf[..len as usize]);
+        if title.trim().is_empty() { continue; }
+        let db_path = db_name_from_title(&title);
+        let app = db_path.trim_start_matches("ds_profiles/").trim_end_matches(".db").to_string();
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        result.push(WindowInfo { hwnd, raw, title, app, pid });
+    }
+    result
+}
+
 // ── Daemon Mode: Background Window Enumeration ──────
 unsafe extern "system" fn enum_windows_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let vec = &mut *(lparam.0 as *mut Vec<isize>);
@@ -2036,37 +2067,15 @@ unsafe fn get_exe_name(pid: u32) -> String {
 }
 
 unsafe fn enum_windows_to_json() {
-    let ds = HWND(DS_HWND.load(SeqCst) as *mut _);
-    let hwnds = collect_windows();
+    let windows = get_visible_windows();
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let mut entries = Vec::new();
 
-    for &raw in &hwnds {
-        let hwnd = HWND(raw as *mut _);
-        if !IsWindowVisible(hwnd).as_bool() { continue; }
-        if !ds.0.is_null() && hwnd == ds { continue; }
-        if is_shell(hwnd) { continue; }
-
-        let mut buf = [0u16; 256];
-        let len = GetWindowTextW(hwnd, &mut buf);
-        if len == 0 { continue; }
-        let title = String::from_utf16_lossy(&buf[..len as usize]);
-        if title.trim().is_empty() { continue; }
-
-        let db_path = db_name_from_title(&title);
-        let app = db_path.trim_start_matches("ds_profiles/").trim_end_matches(".db");
-
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        let exe = get_exe_name(pid);
-
-        // JSON-escape
-        let title_j = title.replace('\\', "\\\\").replace('"', "\\\"");
-        let app_j = app.replace('\\', "\\\\").replace('"', "\\\"");
-        let exe_j = exe.replace('\\', "\\\\").replace('"', "\\\"");
+    for w in &windows {
+        let exe = get_exe_name(w.pid);
         entries.push(format!(
             r#"    {{"title":"{}","app":"{}","exe":"{}","hwnd":{}}}"#,
-            title_j, app_j, exe_j, raw
+            json_escape(&w.title), json_escape(&w.app), json_escape(&exe), w.raw
         ));
     }
 
@@ -2075,6 +2084,11 @@ unsafe fn enum_windows_to_json() {
         ts, entries.join(",\n")
     );
     let _ = fs::write(WINDOWS_FILE, json);
+    // Heartbeat: touch is_active so MCP knows DS is alive (it checks mtime < 10s)
+    if !snapped() {
+        write_active_status("");
+    }
+    // When snapped, is_active is refreshed in do_sync's 1/sec heartbeat
 }
 
 unsafe fn check_snap_request(me: HWND) {
@@ -2087,28 +2101,8 @@ unsafe fn check_snap_request(me: HWND) {
     if requested.is_empty() { return; }
     log(&format!("snap_request: looking for '{}'", requested));
 
-    let ds = HWND(DS_HWND.load(SeqCst) as *mut _);
-    let hwnds = collect_windows();
-    let mut target_hwnd: Option<HWND> = None;
-
-    for &raw in &hwnds {
-        let hwnd = HWND(raw as *mut _);
-        if !IsWindowVisible(hwnd).as_bool() { continue; }
-        if !ds.0.is_null() && hwnd == ds { continue; }
-        if is_shell(hwnd) { continue; }
-
-        let mut buf = [0u16; 256];
-        let len = GetWindowTextW(hwnd, &mut buf);
-        if len == 0 { continue; }
-        let title = String::from_utf16_lossy(&buf[..len as usize]);
-
-        let db_path = db_name_from_title(&title);
-        let app = db_path.trim_start_matches("ds_profiles/").trim_end_matches(".db");
-        if app == requested {
-            target_hwnd = Some(hwnd);
-            break;
-        }
-    }
+    let windows = get_visible_windows();
+    let target_hwnd = windows.iter().find(|w| w.app == requested).map(|w| w.hwnd);
 
     match target_hwnd {
         Some(target) => {
@@ -2123,6 +2117,10 @@ unsafe fn check_snap_request(me: HWND) {
             DAEMON_SNAP.store(true, SeqCst);
             do_snap(me, target);
             DAEMON_SNAP.store(false, SeqCst);
+
+            // If this is a browser, check CDP and offer restart if needed
+            ensure_browser_cdp(&requested);
+
             let _ = fs::write(SNAP_RESULT_FILE,
                 format!(r#"{{"status":"ok","app":"{}"}}"#, requested));
         }
@@ -2134,16 +2132,71 @@ unsafe fn check_snap_request(me: HWND) {
     }
 }
 
+// ── Overlay Mode Check ──────────────────────────────
+unsafe fn check_overlay_mode(me: HWND) {
+    let mode = fs::read_to_string(OVERLAY_MODE_FILE).unwrap_or_default();
+    let want_agent = mode.trim().eq_ignore_ascii_case("agent");
+    let was_agent = AGENT_MODE.load(SeqCst);
+    if want_agent != was_agent {
+        AGENT_MODE.store(want_agent, SeqCst);
+        if want_agent {
+            log("overlay_mode: switching to AGENT (hidden)");
+            if IsWindowVisible(me).as_bool() { let _ = ShowWindow(me, SW_HIDE); }
+        } else {
+            log("overlay_mode: switching to HUMAN (visible)");
+            if !IsWindowVisible(me).as_bool() { let _ = ShowWindow(me, SW_SHOWNA); }
+        }
+    }
+}
+
 // ── Position Sync (60fps) ───────────────────────────
 unsafe fn do_sync(me: HWND) {
     if !snapped() { return; }
     let t = tgt();
-    if t.0.is_null() || !IsWindow(t).as_bool() { log("do_sync: target gone, unsnapping"); do_unsnap(me); return; }
-    if IsIconic(t).as_bool() {
-        if IsWindowVisible(me).as_bool() { let _ = ShowWindow(me, SW_HIDE); }
+    if t.0.is_null() || !IsWindow(t).as_bool() || !IsWindowVisible(t).as_bool() {
+        log("do_sync: target gone or hidden, unsnapping");
+        do_unsnap(me);
         return;
     }
-    if !IsWindowVisible(me).as_bool() { let _ = ShowWindow(me, SW_SHOWNA); }
+    // Heartbeat + process-alive check (throttled to 1/sec)
+    {
+        let now_ms = START_TIME.get_or_init(Instant::now).elapsed().as_millis() as isize;
+        let last = LAST_PROC_CHECK.load(SeqCst);
+        if now_ms - last > 1000 {
+            LAST_PROC_CHECK.store(now_ms, SeqCst);
+            // Touch is_active so MCP knows DS is alive (it checks mtime)
+            let db = CURRENT_DB.lock().unwrap().clone();
+            write_active_status(&db);
+            // Is the target process still alive?
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(t, Some(&mut pid));
+            if pid == 0 {
+                log("do_sync: target process PID=0, unsnapping");
+                do_unsnap(me);
+                return;
+            }
+            use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+            use windows::Win32::Foundation::CloseHandle;
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            match h {
+                Ok(handle) => { let _ = CloseHandle(handle); }
+                Err(_) => {
+                    log(&format!("do_sync: target process {} dead, unsnapping", pid));
+                    do_unsnap(me);
+                    return;
+                }
+            }
+        }
+    }
+    // Agent mode: overlay always hidden, but still track position for coordinate math
+    if AGENT_MODE.load(SeqCst) {
+        if IsWindowVisible(me).as_bool() { let _ = ShowWindow(me, SW_HIDE); }
+    } else if IsIconic(t).as_bool() {
+        if IsWindowVisible(me).as_bool() { let _ = ShowWindow(me, SW_HIDE); }
+        return;
+    } else if !IsWindowVisible(me).as_bool() {
+        let _ = ShowWindow(me, SW_SHOWNA);
+    }
     let mut trc = RECT::default();
     let _ = GetWindowRect(t, &mut trc);
     let mut prc = RECT::default();
@@ -2403,6 +2456,77 @@ unsafe fn paint(hwnd: HWND) {
     let _ = EndPaint(hwnd, &ps);
 }
 
+// ── System Tray Icon ─────────────────────────────────
+
+unsafe fn add_tray_icon(hwnd: HWND) {
+    use windows::Win32::UI::Shell::{
+        Shell_NotifyIconW, NOTIFYICONDATAW, NIM_ADD, NIF_MESSAGE, NIF_ICON, NIF_TIP,
+    };
+    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ID;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    // Load the embedded EXE icon (resource ID 1 = main icon from winresource)
+    let hinst = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
+    let icon = LoadImageW(
+        hinst,
+        PCWSTR(1 as *const u16),  // resource ID 1
+        IMAGE_ICON,
+        16, 16,  // small icon for tray
+        LR_DEFAULTCOLOR,
+    );
+    nid.hIcon = match icon {
+        Ok(h) => HICON(h.0),
+        Err(_) => LoadIconW(HINSTANCE::default(), IDI_APPLICATION).unwrap_or_default(),
+    };
+    // Tooltip: "DirectShell"
+    let tip = "DirectShell\0";
+    let tip_wide: Vec<u16> = tip.encode_utf16().collect();
+    let copy_len = tip_wide.len().min(nid.szTip.len());
+    nid.szTip[..copy_len].copy_from_slice(&tip_wide[..copy_len]);
+    let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+    log("Tray icon added");
+}
+
+unsafe fn remove_tray_icon(hwnd: HWND) {
+    use windows::Win32::UI::Shell::{Shell_NotifyIconW, NOTIFYICONDATAW, NIM_DELETE};
+    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ID;
+    let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+unsafe fn show_tray_menu(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreatePopupMenu, InsertMenuW, TrackPopupMenu,
+        MF_STRING, MF_SEPARATOR, TPM_BOTTOMALIGN, TPM_LEFTALIGN, DestroyMenu,
+    };
+    let menu = CreatePopupMenu().unwrap();
+    let is_agent = AGENT_MODE.load(SeqCst);
+    let mode_label = if is_agent {
+        "Switch to Human Mode\0"
+    } else {
+        "Switch to Agent Mode\0"
+    };
+    let mode_wide: Vec<u16> = mode_label.encode_utf16().collect();
+    let exit_label: Vec<u16> = "Exit DirectShell\0".encode_utf16().collect();
+    let sep_label: Vec<u16> = "\0".encode_utf16().collect();
+
+    let _ = InsertMenuW(menu, 0, MF_STRING, IDM_TOGGLE_MODE as usize, PCWSTR(mode_wide.as_ptr()));
+    let _ = InsertMenuW(menu, 1, MF_SEPARATOR, 0, PCWSTR(sep_label.as_ptr()));
+    let _ = InsertMenuW(menu, 2, MF_STRING, IDM_EXIT as usize, PCWSTR(exit_label.as_ptr()));
+
+    // Required: SetForegroundWindow before TrackPopupMenu so menu dismisses properly
+    let _ = SetForegroundWindow(hwnd);
+    let mut pt = std::mem::zeroed();
+    let _ = GetCursorPos(&mut pt);
+    let _ = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, None);
+    let _ = DestroyMenu(menu);
+}
+
 // ── Window Procedure ────────────────────────────────
 unsafe extern "system" fn wndproc(
     hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
@@ -2503,7 +2627,7 @@ unsafe extern "system" fn wndproc(
                 TREE_TIMER => { dump_tree(); },
                 INJECT_TIMER => { process_injections(); },
                 ENUM_TIMER => { enum_windows_to_json(); },
-                SNAP_REQ_TIMER => { check_snap_request(hwnd); },
+                SNAP_REQ_TIMER => { check_snap_request(hwnd); check_overlay_mode(hwnd); },
                 _ => {}
             }
             LRESULT(0)
@@ -2524,6 +2648,7 @@ unsafe extern "system" fn wndproc(
         }
 
         WM_DESTROY => {
+            remove_tray_icon(hwnd);
             let hk = KB_HOOK.swap(0, SeqCst);
             if hk != 0 {
                 let _ = UnhookWindowsHookEx(HHOOK(hk as *mut _));
@@ -2533,7 +2658,289 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
 
+        // System Tray icon callback
+        x if x == WM_TRAYICON => {
+            let event = (lp.0 & 0xFFFF) as u32;
+            // WM_RBUTTONUP = 0x0205, WM_LBUTTONUP = 0x0202
+            if event == 0x0205 || event == 0x0202 {
+                show_tray_menu(hwnd);
+            }
+            LRESULT(0)
+        }
+
+        // Menu command from tray popup
+        WM_COMMAND => {
+            let cmd = (wp.0 & 0xFFFF) as u16;
+            match cmd {
+                IDM_TOGGLE_MODE => {
+                    let is_agent = AGENT_MODE.load(SeqCst);
+                    let new_mode = if is_agent { "human" } else { "agent" };
+                    let _ = fs::write(OVERLAY_MODE_FILE, new_mode);
+                    // Apply immediately
+                    AGENT_MODE.store(!is_agent, SeqCst);
+                    if is_agent {
+                        log("tray: switched to HUMAN mode");
+                        if !IsWindowVisible(hwnd).as_bool() {
+                            let _ = ShowWindow(hwnd, SW_SHOWNA);
+                        }
+                    } else {
+                        log("tray: switched to AGENT mode");
+                        if IsWindowVisible(hwnd).as_bool() {
+                            let _ = ShowWindow(hwnd, SW_HIDE);
+                        }
+                    }
+                }
+                IDM_EXIT => {
+                    log("tray: exit requested");
+                    let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+
         _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+// ── Browser CDP Restart ────────────────────────────────
+// When DS snaps to a browser and CDP is not available, offer to restart the browser
+// with the correct CDP flags. This replaces the old shortcut-patching approach —
+// DS now controls the browser launch directly via CreateProcessW.
+
+const DS_BASE_FLAGS: &str = "--remote-allow-origins=* --force-renderer-accessibility";
+const CDP_PORTS_FILE: &str = "ds_profiles/cdp_ports.json";
+
+/// Each browser gets its own CDP port so multiple browsers can run simultaneously.
+const BROWSER_CDP_PORTS: [(&str, u16); 6] = [
+    ("chrome.exe",   9222),
+    ("opera.exe",    9223),
+    ("msedge.exe",   9224),
+    ("brave.exe",    9225),
+    ("vivaldi.exe",  9226),
+    ("chromium.exe", 9227),
+];
+
+/// UIA app name fragments → browser exe names
+const BROWSER_APP_MAP: [(&str, &str); 8] = [
+    ("google_chrome", "chrome.exe"),
+    ("chrome",        "chrome.exe"),
+    ("opera",         "opera.exe"),
+    ("edge",          "msedge.exe"),
+    ("microsoft_edge","msedge.exe"),
+    ("brave",         "brave.exe"),
+    ("vivaldi",       "vivaldi.exe"),
+    ("chromium",      "chromium.exe"),
+];
+
+/// Get a NON-DEFAULT user-data-dir for CDP debugging.
+/// Chrome 136+ blocks --remote-debugging-port when using the default profile.
+/// We create a separate DS profile dir that Chrome accepts for debugging.
+/// The dir is persistent so bookmarks/logins survive across restarts.
+fn get_browser_user_data_dir(exe_name: &str) -> Option<String> {
+    let local = std::env::var("LOCALAPPDATA").ok()?;
+    let browser_tag = match exe_name {
+        "chrome.exe"   => "Chrome",
+        "msedge.exe"   => "Edge",
+        "brave.exe"    => "Brave",
+        "vivaldi.exe"  => "Vivaldi",
+        "chromium.exe" => "Chromium",
+        "opera.exe"    => "Opera",
+        _ => return None,
+    };
+    let dir = format!("{}\\DirectShell\\BrowserProfiles\\{}", local, browser_tag);
+    // Create the directory if it doesn't exist
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
+/// Resolve UIA app name to browser exe name.
+fn browser_exe_from_app(app_name: &str) -> Option<&'static str> {
+    let app_lower = app_name.to_lowercase();
+    BROWSER_APP_MAP.iter()
+        .find(|(fragment, _)| app_lower.contains(fragment))
+        .map(|(_, exe)| *exe)
+}
+
+/// Get CDP port for a browser exe name.
+fn cdp_port_for_exe(exe_name: &str) -> u16 {
+    BROWSER_CDP_PORTS.iter()
+        .find(|(exe, _)| *exe == exe_name)
+        .map(|(_, p)| *p)
+        .unwrap_or(9222)
+}
+
+/// Check if a TCP port is open on localhost.
+fn is_port_open(port: u16) -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(300),
+    ).is_ok()
+}
+
+/// Find the full exe path for a browser by searching running processes or known install paths.
+fn find_browser_exe_path(exe_name: &str) -> Option<String> {
+    // Check known install locations
+    let paths: Vec<String> = match exe_name {
+        "chrome.exe" => vec![
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe".into(),
+            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe".into(),
+        ],
+        "msedge.exe" => vec![
+            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe".into(),
+            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe".into(),
+        ],
+        "brave.exe" => vec![
+            format!("{}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+                std::env::var("LOCALAPPDATA").unwrap_or_default()),
+        ],
+        "vivaldi.exe" => vec![
+            format!("{}\\Vivaldi\\Application\\vivaldi.exe",
+                std::env::var("LOCALAPPDATA").unwrap_or_default()),
+        ],
+        "opera.exe" => vec![
+            format!("{}\\Programs\\Opera GX\\opera.exe",
+                std::env::var("LOCALAPPDATA").unwrap_or_default()),
+            format!("{}\\Programs\\Opera\\opera.exe",
+                std::env::var("LOCALAPPDATA").unwrap_or_default()),
+        ],
+        _ => vec![],
+    };
+    paths.into_iter().find(|p| std::path::Path::new(p).exists())
+}
+
+/// Kill all processes of a browser, wait, then relaunch with CDP flags.
+/// Returns true if CDP port is open after relaunch.
+unsafe fn restart_browser_with_cdp(exe_name: &str) -> bool {
+    let port = cdp_port_for_exe(exe_name);
+    let exe_path = match find_browser_exe_path(exe_name) {
+        Some(p) => p,
+        None => {
+            log(&format!("cdp_restart: cannot find exe path for {}", exe_name));
+            return false;
+        }
+    };
+
+    // Build command line with CDP flags
+    let mut cmd = format!("\"{}\" --remote-debugging-port={} {}",
+        exe_path, port, DS_BASE_FLAGS);
+    if let Some(data_dir) = get_browser_user_data_dir(exe_name) {
+        cmd.push_str(&format!(" --user-data-dir=\"{}\"", data_dir));
+    }
+    log(&format!("cdp_restart: killing {} processes...", exe_name));
+
+    // Kill all processes of this browser
+    let kill_cmd = format!("taskkill /F /IM {} /T", exe_name);
+    // (kill command built inline below)
+
+    use windows::Win32::System::Threading::{CreateProcessW, STARTUPINFOW, PROCESS_INFORMATION,
+        CREATE_NO_WINDOW, WaitForSingleObject};
+
+    let mut si: STARTUPINFOW = std::mem::zeroed();
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+
+    let mut kill_line: Vec<u16> = format!("cmd.exe /C {}\0", kill_cmd).encode_utf16().collect();
+    if CreateProcessW(
+        PCWSTR::null(), PWSTR(kill_line.as_mut_ptr()),
+        None, None, FALSE, CREATE_NO_WINDOW, None, PCWSTR::null(),
+        &si, &mut pi,
+    ).is_ok() {
+        WaitForSingleObject(pi.hProcess, 5000);
+        let _ = windows::Win32::Foundation::CloseHandle(pi.hProcess);
+        let _ = windows::Win32::Foundation::CloseHandle(pi.hThread);
+    }
+
+    // Wait for processes to fully exit
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    log(&format!("cdp_restart: launching {} on port {}", exe_name, port));
+    log(&format!("cdp_restart: cmd = {}", cmd));
+
+    // Launch browser with CDP flags
+    let mut si2: STARTUPINFOW = std::mem::zeroed();
+    si2.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut pi2: PROCESS_INFORMATION = std::mem::zeroed();
+    let mut cmd_wide: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
+
+    if CreateProcessW(
+        PCWSTR::null(), PWSTR(cmd_wide.as_mut_ptr()),
+        None, None, FALSE, windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(0),
+        None, PCWSTR::null(),
+        &si2, &mut pi2,
+    ).is_err() {
+        log(&format!("cdp_restart: CreateProcessW FAILED for {}", exe_name));
+        return false;
+    }
+    let _ = windows::Win32::Foundation::CloseHandle(pi2.hProcess);
+    let _ = windows::Win32::Foundation::CloseHandle(pi2.hThread);
+
+    // Wait for CDP port to become available (up to 8 seconds)
+    for i in 0..16 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if is_port_open(port) {
+            log(&format!("cdp_restart: CDP port {} open after {}ms", port, (i + 1) * 500));
+            return true;
+        }
+    }
+    log(&format!("cdp_restart: CDP port {} NOT open after 8s", port));
+    false
+}
+
+/// Called after do_snap when the target is a browser.
+/// Checks if CDP is available; if not, shows popup and offers restart.
+unsafe fn ensure_browser_cdp(app_name: &str) {
+    let exe_name = match browser_exe_from_app(app_name) {
+        Some(e) => e,
+        None => return, // Not a known browser
+    };
+    let port = cdp_port_for_exe(exe_name);
+
+    // CDP already running? Great, nothing to do.
+    if is_port_open(port) {
+        log(&format!("ensure_cdp: {} CDP port {} already open", app_name, port));
+        return;
+    }
+
+    log(&format!("ensure_cdp: {} CDP port {} NOT open — offering restart", app_name, port));
+
+    // Show popup
+    let msg = format!(
+        "DirectShell needs CDP (Chrome DevTools Protocol) to control this browser.\n\n\
+         Browser: {}\n\
+         CDP Port: {}\n\n\
+         The browser will restart with a separate DirectShell profile.\n\
+         Your original profile and tabs remain untouched.\n\
+         (Profile location: %LOCALAPPDATA%\\DirectShell\\BrowserProfiles)\n\n\
+         Restart now?\0",
+        app_name, port
+    );
+    let title = "DirectShell \u{2014} Browser Restart Required\0";
+    let wide_msg: Vec<u16> = msg.encode_utf16().collect();
+    let wide_title: Vec<u16> = title.encode_utf16().collect();
+
+    let result = MessageBoxW(
+        HWND::default(),
+        PCWSTR(wide_msg.as_ptr()),
+        PCWSTR(wide_title.as_ptr()),
+        MB_OKCANCEL | MB_ICONQUESTION,
+    );
+
+    if result == MESSAGEBOX_RESULT(1) { // IDOK
+        if restart_browser_with_cdp(exe_name) {
+            log(&format!("ensure_cdp: {} restarted with CDP successfully", app_name));
+        } else {
+            let fail_msg = format!(
+                "Browser restart failed.\n\n\
+                 CDP port {} did not open.\n\
+                 DirectShell will continue in UIA-only mode.\0", port);
+            let wide_fail: Vec<u16> = fail_msg.encode_utf16().collect();
+            MessageBoxW(HWND::default(), PCWSTR(wide_fail.as_ptr()),
+                PCWSTR(wide_title.as_ptr()), MB_OK | MB_ICONWARNING);
+        }
+    } else {
+        log(&format!("ensure_cdp: user declined restart for {}", app_name));
     }
 }
 
@@ -2548,8 +2955,29 @@ fn main() -> Result<()> {
         }
     }
 
-    // Log-Datei bei Start leeren
-    let _ = fs::write(LOG_FILE, "");
+    // ── Set CWD to EXE directory ──────────────────────────────────────
+    // All paths (ds_profiles/, log, etc.) are relative.
+    // Without this, CWD depends on how the EXE was launched (shortcut, terminal, etc.)
+    // and ds_profiles/ ends up in random locations.
+    {
+        let mut exe_buf = [0u16; 512];
+        let len = unsafe { GetModuleFileNameW(HMODULE::default(), &mut exe_buf) } as usize;
+        if len > 0 {
+            let exe_path = String::from_utf16_lossy(&exe_buf[..len]);
+            if let Some(dir) = std::path::Path::new(&exe_path).parent() {
+                let _ = std::env::set_current_dir(dir);
+                // Write breadcrumb so MCP server can discover ds_profiles automatically
+                if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
+                    let bc_dir = std::path::Path::new(&local_app).join("DirectShell");
+                    let _ = fs::create_dir_all(&bc_dir);
+                    let abs_profiles = dir.join(DB_DIR);
+                    let _ = fs::write(bc_dir.join("profiles_path.txt"),
+                                      abs_profiles.to_string_lossy().as_bytes());
+                }
+            }
+        }
+    }
+
     // Clear stale snap state from previous session
     write_active_status("");
     log("=== DirectShell START ===");
@@ -2557,6 +2985,10 @@ fn main() -> Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         log("COM initialized");
+
+        // Write cdp_ports.json so the MCP server knows port assignments
+        let ports_content = "{\n  \"chrome\": 9222,\n  \"opera\": 9223,\n  \"edge\": 9224,\n  \"brave\": 9225,\n  \"vivaldi\": 9226,\n  \"chromium\": 9227\n}";
+        let _ = fs::write(CDP_PORTS_FILE, ports_content);
 
         // Screen Reader Flag SOFORT setzen — bevor irgendwas passiert.
         // Apps die NACH DirectShell starten sehen das Flag von Anfang an.
@@ -2568,10 +3000,31 @@ fn main() -> Result<()> {
         );
         log("SPI_SETSCREENREADER = TRUE (global, at startup)");
 
+        // Global WinEvent Hook — macht DS für ALLE Apps als Screen Reader sichtbar.
+        // Chrome probt mit NotifyWinEvent(EVENT_SYSTEM_ALERT) ob jemand zuhört.
+        // Unser Hook fängt das ab + antwortet mit AccessibleObjectFromWindow.
+        // → Chrome (und jeder andere Browser) aktiviert Accessibility automatisch.
+        // Gilt für ALLE Fenster: Hauptfenster, Popups, neue Tabs — alles.
+        const EVENT_SYSTEM_ALERT: u32 = 0x0002;
+        const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+        let _at_hook = SetWinEventHook(
+            EVENT_SYSTEM_ALERT,   // eventmin — Chrome's AT probe
+            EVENT_SYSTEM_ALERT,   // eventmax — nur dieses Event
+            HMODULE::default(),   // kein DLL, Callback in unserem Prozess
+            Some(global_winevent_proc),
+            0,                    // alle Prozesse
+            0,                    // alle Threads
+            WINEVENT_OUTOFCONTEXT, // async Callback auf unserem Message Loop
+        );
+        log("Global WinEvent hook installed — DS visible as AT to all apps");
+
         let inst = GetModuleHandleW(None)?;
         let hinst: HINSTANCE = inst.into();
         let cls = w!("DirectShell");
 
+        // Load embedded icon for window class (taskbar + alt-tab)
+        let app_icon = LoadImageW(hinst, PCWSTR(1 as *const u16), IMAGE_ICON, 0, 0, LR_DEFAULTCOLOR | LR_DEFAULTSIZE);
+        let app_icon_sm = LoadImageW(hinst, PCWSTR(1 as *const u16), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
         let wc = WNDCLASSEXW {
             cbSize: mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
@@ -2580,6 +3033,8 @@ fn main() -> Result<()> {
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             hbrBackground: CreateSolidBrush(INVIS),
             lpszClassName: cls,
+            hIcon: HICON(app_icon.as_ref().map(|h| h.0).unwrap_or(std::ptr::null_mut())),
+            hIconSm: HICON(app_icon_sm.as_ref().map(|h| h.0).unwrap_or(std::ptr::null_mut())),
             ..Default::default()
         };
         RegisterClassExW(&wc);
@@ -2595,6 +3050,7 @@ fn main() -> Result<()> {
         SetLayeredWindowAttributes(hwnd, INVIS, ALPHA, LWA_COLORKEY | LWA_ALPHA)?;
         log(&format!("Window created: 0x{:X}", hwnd.0 as usize));
         DS_HWND.store(hwnd.0 as isize, SeqCst);
+        add_tray_icon(hwnd);
 
         let _ = SetTimer(hwnd, ANIM_TIMER, ANIM_MS, None);
 

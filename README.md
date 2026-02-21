@@ -7,7 +7,7 @@
 <p align="center"><em><strong>As of February 17, 2026, every screenshot-based AI agent, every enterprise API wrapper, and every RPA tool on Earth is legacy technology.</strong></em></p>
 
 <p align="center">
-  <a href="https://youtu.be/nvZobyt0KBg">Watch the Demo</a> &middot;
+  <a href="https://youtu.be/rHfVj1KpCDU">Watch the Demo</a> &middot;
   <a href="LLM_GUIDE.md">LLM Quick Start Guide</a> &middot;
   <a href="Dokumentation/PAPER.md">Read the Whitepaper</a>
 </p>
@@ -101,7 +101,7 @@ That's like every room in a house needing its own lock with its own key — and 
 
 ## Demo
 
-[![DirectShell Demo](https://img.youtube.com/vi/nvZobyt0KBg/maxresdefault.jpg)](https://youtu.be/nvZobyt0KBg)
+[![DirectShell Demo](https://img.youtube.com/vi/rHfVj1KpCDU/maxresdefault.jpg)](https://youtu.be/rHfVj1KpCDU)
 
 On February 17, 2026, DirectShell demonstrated three paradigms in 5 minutes:
 
