@@ -323,7 +323,7 @@ Routing is automatic — you don't need to think about it. The `_BROWSER_APPS` s
 - **Chromium activation**: Chromium-based apps need a few seconds to build their accessibility tree after snapping. Be patient on first snap.
 - **Canvas-rendered content**: Some web apps render on canvas (e.g., Google Sheets cells). The a11y tree shows 0 elements for these. Use `ds_type` with keyboard navigation (Tab, Enter) instead.
 - **Accessibility quality varies**: The tree is only as good as the app's accessibility implementation. Major enterprise software is comprehensive. Smaller apps may have unnamed buttons or missing values.
-- **Windows only (for now)**: macOS (NSAccessibility) and Linux (AT-SPI2) have equivalent frameworks. Cross-platform support is planned.
+- **Windows native, Linux port available**: macOS (NSAccessibility) and Linux (AT-SPI2) have equivalent frameworks. A community Linux port is available at [DirectShell-Linux](https://github.com/Harfho/DirectShell-Linux).
 
 The architecture is sound. The learnings system means every limitation you encounter and document makes every future session smarter.
 
