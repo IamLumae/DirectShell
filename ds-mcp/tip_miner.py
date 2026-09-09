@@ -90,69 +90,41 @@ def parse_logs(logs_dir: Path) -> list[dict]:
 
 
 def extract_failure_chains(entries: list[dict]) -> list[dict]:
-    """Extract failure→recovery pairs from the action stream.
+    """Attribute NEXT call's feedback to this action, never to the feedback carrier.
 
-    A failure chain is 1+ consecutive prev_ok=no entries followed by
-    prev_ok=yes (the recovery).
-
-    Each chain also carries the last_url — the most recent URL from a
-    ds_navigate call before the failure started. This is critical for
-    condition inference later.
+    Unknown feedback or application/session boundaries break evidence chains.
+    These are reported recovery sequences, not causal proof of a general remedy.
     """
-    chains = []
-    last_url = None  # track last navigated URL across the stream
-    i = 0
-
-    while i < len(entries):
-        # Track URLs as we scan forward
-        entry = entries[i]
-        if entry.get("tool") == "ds_navigate":
-            url = entry.get("params", {}).get("url", "")
-            if url:
-                last_url = url
-        # Also track URLs from ds_tab results (tab title contains URL info)
-        if entry.get("tool") == "ds_tab":
-            result = entry.get("result", "")
-            # ds_tab result is like "Switched to: Title | URL"
-            # but doesn't always contain URL — still useful for context
-
-        # Look for start of failure chain
-        if entry.get("prev_ok") != "no":
-            i += 1
-            continue
-
-        # Found a failure. Collect the chain.
-        chain_start = i
-        url_at_failure = last_url  # snapshot the URL context
-
-        while i < len(entries) and entries[i].get("prev_ok") == "no":
-            i += 1
-
-        chain_length = i - chain_start
-        if chain_length < 1:
-            continue
-
-        # Look for recovery within next 3 actions
-        recovery = None
-        chain_app = entries[chain_start].get("app", entries[chain_start].get("mode", "unknown"))
-        for j in range(i, min(i + 3, len(entries))):
-            if entries[j].get("prev_ok") == "yes":
-                recovery = entries[j]
-                break
-
-        if recovery:
-            chains.append({
-                "failures": [entries[k] for k in range(chain_start, i)],
-                "recovery": recovery,
-                "chain_length": chain_length,
-                "app": chain_app,
-                "failed_tool": entries[chain_start].get("tool", "unknown"),
-                "recovery_tool": recovery.get("tool", "unknown"),
-                "timestamp": entries[chain_start].get("ts", 0),
-                "last_url": url_at_failure,  # URL context for condition inference
-            })
-
-    print(f"Extracted {len(chains)} failure chains")
+    chains, failures = [], []
+    active_scope, last_url, failure_url = None, None, None
+    for index, entry in enumerate(entries[:-1]):
+        following = entries[index + 1]
+        session = entry.get('session_id', entry.get('_file'))
+        next_session = following.get('session_id', following.get('_file'))
+        app = entry.get('app', entry.get('mode', 'unknown'))
+        scope = (session, app, entry.get('mode'))
+        if scope != active_scope:
+            failures, last_url = [], None
+            active_scope = scope
+        if entry.get('tool') == 'ds_navigate':
+            last_url = entry.get('params', {}).get('url') or last_url
+        feedback = following.get('prev_ok', 'unknown') if session == next_session else 'unknown'
+        if feedback == 'no':
+            if not failures:
+                failure_url = last_url
+            failures.append(entry)
+        elif feedback == 'yes':
+            if failures:
+                chains.append({
+                    'failures': list(failures), 'recovery': entry,
+                    'chain_length': len(failures), 'app': app,
+                    'failed_tool': failures[0].get('tool', 'unknown'),
+                    'recovery_tool': entry.get('tool', 'unknown'),
+                    'timestamp': failures[0].get('ts', 0), 'last_url': failure_url,
+                })
+            failures = []
+        else:
+            failures = []
     return chains
 
 

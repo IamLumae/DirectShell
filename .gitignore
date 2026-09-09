@@ -1,4 +1,5 @@
 /target
+/build-attia/
 ds-mcp/__pycache__/
 *.pyc
 .env

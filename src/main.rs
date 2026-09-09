@@ -10,6 +10,12 @@
 
 #![windows_subsystem = "windows"]
 
+mod attia;
+mod automation_client;
+mod native_actions;
+mod window_query;
+mod snapshot_store;
+
 use std::ffi::c_void;
 use std::fs;
 use std::mem;
@@ -27,7 +33,6 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_FORMAT,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // ── Farben (COLORREF = 0x00BBGGRR) ─────────────────
@@ -66,7 +71,6 @@ const SNAP_REQ_TIMER: usize = 6;  // Snap Request Polling (AI-triggered)
 const SNAP_REQ_MS: u32 = 200;     // 5 Hz — schnelle Reaktion auf AI-Befehle
 const MAX_DEPTH: i32 = i32::MAX;  // Primitivum. Kein Limit.
 const MAX_CHILDREN: i32 = i32::MAX; // Primitivum. Kein Limit.
-const STREAM_BATCH: i32 = 200;    // COMMIT alle 200 Elemente → progressive Verfügbarkeit
 const DB_DIR: &str = "ds_profiles";  // Persistente App-DBs
 const ACTIVE_FILE: &str = "ds_profiles/is_active";  // Status für KI-Agents
 const LOG_FILE: &str = "ds_profiles/directshell.log";      // Log neben den Profilen
@@ -85,6 +89,7 @@ static LOG_BUF: Mutex<Option<VecDeque<String>>> = Mutex::new(None);
 const LOG_MAX: usize = 100;
 
 fn log(msg: &str) {
+    if attia::enabled() { return; } // ATTIA records bounded action metadata, not UI/input text.
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -111,8 +116,9 @@ fn log(msg: &str) {
 static TARGET_HW: AtomicIsize = AtomicIsize::new(0);
 static IS_SNAPPED: AtomicBool = AtomicBool::new(false);
 static TREE_BUSY: AtomicBool = AtomicBool::new(false);
+static ACTION_EXECUTING: AtomicBool = AtomicBool::new(false);
+static AUTOMATION_GATE: Mutex<()> = Mutex::new(());
 static CURRENT_DB: Mutex<String> = Mutex::new(String::new());
-static KB_HOOK: AtomicIsize = AtomicIsize::new(0);
 static EVENT_UIA_PTR: AtomicIsize = AtomicIsize::new(0);      // UIA instance for event handlers (cleanup on unsnap)
 static A11Y_UIA_PTR: AtomicIsize = AtomicIsize::new(0);       // UIA instance from activate_accessibility (reused across snaps)
 static LAST_EVENT_DUMP_MS: AtomicIsize = AtomicIsize::new(0);  // Debounce: last event-triggered dump timestamp
@@ -126,8 +132,6 @@ static START_TIME: OnceLock<Instant> = OnceLock::new();
 static DS_HWND: AtomicIsize = AtomicIsize::new(0);           // Daemon: eigenes Fenster-Handle
 static DAEMON_SNAP: AtomicBool = AtomicBool::new(false);     // Daemon: skip CDP popup
 static AGENT_MODE: AtomicBool = AtomicBool::new(false);      // Agent mode: overlay hidden
-static LAST_CLICK_X: AtomicI32 = AtomicI32::new(-1);        // Auto-persist: last click X (absolute screen)
-static LAST_CLICK_Y: AtomicI32 = AtomicI32::new(-1);        // Auto-persist: last click Y (absolute screen)
 
 fn tgt() -> HWND { HWND(TARGET_HW.load(SeqCst) as *mut _) }
 fn snapped() -> bool { IS_SNAPPED.load(SeqCst) }
@@ -239,9 +243,7 @@ unsafe fn probe_caption(target: HWND) -> CaptionInfo {
     log(&format!("probe_caption: target=0x{:X}", target.0 as usize));
     let default = CaptionInfo { btn_offset: FALLBACK_BTN_X, bar_height: DEFAULT_TOP_H };
 
-    let uia: IUIAutomation = match CoCreateInstance(
-        &CUIAutomation8, None, CLSCTX_INPROC_SERVER,
-    ) {
+    let uia = match automation_client::create() {
         Ok(u) => u,
         Err(e) => { log(&format!("probe_caption: CoCreateInstance FAILED: {e}")); return default; }
     };
@@ -341,6 +343,7 @@ fn role_name(ct: i32) -> &'static str {
 }
 
 unsafe fn get_value(elem: &IUIAutomationElement) -> String {
+    if attia::enabled() && elem.CurrentIsPassword().map(|v| v.as_bool()).unwrap_or(true) { return String::new(); }
     if let Ok(pat) = elem.GetCurrentPattern(UIA_ValuePatternId) {
         if let Ok(vp) = pat.cast::<IUIAutomationValuePattern>() {
             if let Ok(val) = vp.CurrentValue() {
@@ -411,8 +414,9 @@ fn init_db(db_path: &str) -> Option<Connection> {
     // Migrations for pre-existing DBs
     let _ = conn.execute_batch("ALTER TABLE inject ADD COLUMN target TEXT DEFAULT '';");
     let _ = conn.execute_batch("ALTER TABLE inject ADD COLUMN action TEXT DEFAULT 'text';");
-    // Clear stale actions from previous session
-    let _ = conn.execute("DELETE FROM inject WHERE done=0", []);
+    let _ = conn.execute_batch("ALTER TABLE inject ADD COLUMN outcome TEXT DEFAULT '';");
+    let _ = conn.execute_batch("ALTER TABLE inject ADD COLUMN expires_at INTEGER DEFAULT 0;");
+    if conn.execute_batch("CREATE TABLE IF NOT EXISTS capabilities (name TEXT PRIMARY KEY); INSERT OR IGNORE INTO capabilities VALUES('semantic_native_v1');").is_err() { return None; }
     log("init_db: OK");
     Some(conn)
 }
@@ -421,7 +425,8 @@ fn init_db(db_path: &str) -> Option<Connection> {
 struct StreamCtx<'a> {
     conn: &'a Connection,
     count: i64,
-    batch: i32,
+    failed: bool,
+    truncated: bool,
 }
 
 unsafe fn stream_elements(
@@ -431,7 +436,10 @@ unsafe fn stream_elements(
     parent_id: i64,
     depth: i32,
 ) {
-    if depth > MAX_DEPTH { return; }
+    if ctx.failed { return; }
+    if depth > MAX_DEPTH { ctx.truncated = true; return; }
+    // Password subtrees never enter persisted snapshots, even if a provider fails.
+    if elem.CurrentIsPassword().map(|v|v.as_bool()).unwrap_or(true) {return;}
 
     let ct = elem.CurrentControlType().unwrap_or_default();
     let name = elem.CurrentName().ok().map(|s| s.to_string()).unwrap_or_default();
@@ -444,8 +452,8 @@ unsafe fn stream_elements(
     ctx.count += 1;
     let my_id = ctx.count;
 
-    let _ = ctx.conn.execute(
-        "INSERT INTO elements(id,parent_id,depth,role,name,value,automation_id,enabled,offscreen,x,y,w,h) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+    let inserted = ctx.conn.execute(
+        "INSERT INTO temp.snapshot_elements(id,parent_id,depth,role,name,value,automation_id,enabled,offscreen,x,y,w,h) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             my_id, parent_id, depth,
             role_name(ct.0),
@@ -458,12 +466,7 @@ unsafe fn stream_elements(
         ],
     );
 
-    // Periodic commit: macht bisherige Daten sofort querybar
-    ctx.batch += 1;
-    if ctx.batch >= STREAM_BATCH {
-        let _ = ctx.conn.execute_batch("COMMIT; BEGIN TRANSACTION;");
-        ctx.batch = 0;
-    }
+    if inserted.is_err() { ctx.failed = true; return; }
 
     // Kinder (depth-first = obere Layer kommen zuerst)
     let mut child_count = 0i32;
@@ -472,7 +475,7 @@ unsafe fn stream_elements(
         child_count += 1;
         let mut prev = child;
         loop {
-            if child_count >= MAX_CHILDREN { break; }
+            if child_count >= MAX_CHILDREN { ctx.truncated = true; break; }
             match walker.GetNextSiblingElement(&prev) {
                 Ok(next) => {
                     stream_elements(ctx, &next, walker, my_id, depth + 1);
@@ -486,18 +489,22 @@ unsafe fn stream_elements(
 }
 
 fn dump_tree() {
+    if ACTION_EXECUTING.load(SeqCst){return;}
     if TREE_BUSY.compare_exchange(false, true, SeqCst, SeqCst).is_err() {
         return;
     }
 
     let target_raw = TARGET_HW.load(SeqCst);
-    if target_raw == 0 {
+    let db_path = get_db_path();
+    if target_raw == 0 || db_path.is_empty() {
         TREE_BUSY.store(false, SeqCst);
         return;
     }
 
     std::thread::spawn(move || {
         let t0 = Instant::now();
+        let Ok(_access)=AUTOMATION_GATE.lock() else{TREE_BUSY.store(false,SeqCst);return;};
+        if ACTION_EXECUTING.load(SeqCst){TREE_BUSY.store(false,SeqCst);return;}
 
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -509,9 +516,7 @@ fn dump_tree() {
                 return;
             }
 
-            let uia: IUIAutomation = match CoCreateInstance(
-                &CUIAutomation8, None, CLSCTX_INPROC_SERVER,
-            ) {
+            let uia = match automation_client::create() {
                 Ok(u) => u,
                 Err(e) => {
                     log(&format!("dump[t]: CoCreate FAIL: {e}"));
@@ -549,40 +554,30 @@ fn dump_tree() {
             let ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
 
-            // Streaming: Walk + INSERT gleichzeitig, COMMIT alle 200 Elemente
-            let db_path = get_db_path();
-            if db_path.is_empty() {
-                CoUninitialize();
-                TREE_BUSY.store(false, SeqCst);
-                return;
-            }
+            // Build in connection-private temporary storage; readers keep the last generation.
             if let Some(conn) = init_db(&db_path) {
-                // DROP + CREATE statt DELETE → keine Freelist-Bloat
-                let _ = conn.execute_batch("
-                    DROP TABLE IF EXISTS elements;
-                    DROP TABLE IF EXISTS meta;
-                    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
-                    CREATE TABLE elements (
-                        id INTEGER PRIMARY KEY, parent_id INTEGER, depth INTEGER,
-                        role TEXT NOT NULL, name TEXT, value TEXT, automation_id TEXT,
-                        enabled INTEGER DEFAULT 1, offscreen INTEGER DEFAULT 0,
-                        x INTEGER, y INTEGER, w INTEGER, h INTEGER
-                    );
-                ");
-
-                // Meta
-                let _ = conn.execute(
-                    "INSERT INTO meta(key,value) VALUES('window',?1),('hwnd',?2),('timestamp',?3),('x',?4),('y',?5),('w',?6),('h',?7)",
-                    params![title, format!("0x{:X}", target.0 as usize), ts.to_string(),
-                        win_rc.left, win_rc.top,
-                        win_rc.right - win_rc.left, win_rc.bottom - win_rc.top],
-                );
-
-                // Stream: Walk tree + INSERT in einem Rutsch
-                let _ = conn.execute_batch("BEGIN TRANSACTION;");
-                let mut ctx = StreamCtx { conn: &conn, count: 0, batch: 0 };
+                let _ = conn.busy_timeout(std::time::Duration::from_millis(500));
+                if let Err(error) = snapshot_store::prepare(&conn) {
+                    log(&format!("snapshot prepare failed: {error}"));
+                    CoUninitialize(); TREE_BUSY.store(false, SeqCst); return;
+                }
+                let mut ctx = StreamCtx { conn: &conn, count: 0, failed: false, truncated: false };
                 stream_elements(&mut ctx, &root, &walker, 0, 0);
-                let _ = conn.execute_batch("COMMIT;");
+                if ctx.failed || TARGET_HW.load(SeqCst) != target_raw || get_db_path() != db_path {
+                    log("snapshot discarded: staging failed or target changed");
+                    CoUninitialize(); TREE_BUSY.store(false, SeqCst); return;
+                }
+                let metadata = vec![
+                    ("window".into(),title), ("hwnd".into(),format!("0x{:X}",target.0 as usize)),
+                    ("timestamp".into(),ts.to_string()), ("x".into(),win_rc.left.to_string()),
+                    ("y".into(),win_rc.top.to_string()), ("w".into(),(win_rc.right-win_rc.left).to_string()),
+                    ("h".into(),(win_rc.bottom-win_rc.top).to_string()),
+                    ("truncated".into(),ctx.truncated.to_string()),
+                ];
+                if let Err(error) = snapshot_store::publish(&conn, &metadata) {
+                    log(&format!("snapshot publish failed; previous generation retained: {error}"));
+                    CoUninitialize(); TREE_BUSY.store(false, SeqCst); return;
+                }
 
                 let total_ms = t0.elapsed().as_millis();
                 log(&format!("dump: {} rows streamed, total={}ms", ctx.count, total_ms));
@@ -590,7 +585,9 @@ fn dump_tree() {
                 generate_snap(&db_path);
                 generate_a11y(&db_path);
                 generate_a11y_snap(&db_path);
-                write_active_status(&db_path);
+                if TARGET_HW.load(SeqCst) == target_raw && get_db_path() == db_path {
+                    write_active_status(&db_path);
+                }
             }
 
             CoUninitialize();
@@ -615,6 +612,7 @@ unsafe extern "system" fn global_winevent_proc(
     _event_time: u32,
 ) {
     // Nur auf gültige Fenster reagieren
+    if ACTION_EXECUTING.load(SeqCst){return;}
     if hwnd.0.is_null() || !IsWindow(hwnd).as_bool() { return; }
     // AccessibleObjectFromWindow zurückrufen — DAS ist was Chrome als AT-Präsenz erkennt
     let mut acc: *mut c_void = std::ptr::null_mut();
@@ -624,6 +622,7 @@ unsafe extern "system" fn global_winevent_proc(
         &IAccessible::IID,
         &mut acc,
     );
+    if !acc.is_null(){drop(IAccessible::from_raw(acc));}
 }
 
 // ── Chromium Accessibility Trigger ───────────────────
@@ -633,19 +632,11 @@ unsafe extern "system" fn global_winevent_proc(
 // 3. WM_GETOBJECT auf Chrome_RenderWidgetHostHWND — per-Renderer Aktivierung
 // Wir müssen ALLE DREI triggern damit es auch bei bereits laufendem Browser klappt.
 
-unsafe fn activate_accessibility(target: HWND) {
+pub(crate) unsafe fn activate_accessibility(target: HWND) {
     log("activate_a11y: full activation sequence...");
 
-    // ── Phase 1: System-Level Signal ──
-    // Screen Reader Flag setzen + persistieren
-    let _ = SystemParametersInfoW(
-        SPI_SETSCREENREADER,
-        1,
-        None,
-        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0x0003), // SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
-    );
-
-    // WM_SETTINGCHANGE DIREKT an Target senden (nicht auf Broadcast warten)
+    // Refresh this target's accessibility detection, never change a global
+    // screen-reader preference or broadcast to unrelated applications.
     let _ = SendMessageW(
         target,
         WM_SETTINGCHANGE,
@@ -659,7 +650,7 @@ unsafe fn activate_accessibility(target: HWND) {
     // Reuse existing UIA instance across snaps to avoid memory leaks
     let existing = A11Y_UIA_PTR.load(SeqCst);
     if existing == 0 {
-        if let Ok(uia) = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) {
+        if let Ok(uia) = automation_client::create() {
             let handler: IUIAutomationFocusChangedEventHandler = UiaFocusHandler.into();
             let _ = uia.AddFocusChangedEventHandler(None, &handler);
             log("activate_a11y: UIA FocusChanged handler registered → UiaClientsAreListening() = true");
@@ -687,9 +678,11 @@ unsafe fn activate_accessibility(target: HWND) {
     );
 
     // Alle Child-Windows proben — insbesondere Chrome_RenderWidgetHostHWND
+    if !acc.is_null(){drop(IAccessible::from_raw(acc));}
     unsafe extern "system" fn probe_child(hwnd: HWND, _: LPARAM) -> BOOL {
         let mut acc: *mut c_void = std::ptr::null_mut();
         let _ = AccessibleObjectFromWindow(hwnd, 0xFFFFFFFC, &IAccessible::IID, &mut acc);
+        if !acc.is_null(){drop(IAccessible::from_raw(acc));}
         let _ = SendMessageW(hwnd, WM_GETOBJECT, WPARAM(0), LPARAM(0xFFFFFFFC_u32 as i32 as isize));
         TRUE
     }
@@ -789,6 +782,10 @@ fn sender_name(sender: Option<&IUIAutomationElement>) -> String {
         .map(|s| s.to_string()).unwrap_or_default()
 }
 
+fn event_sender_allowed(sender:Option<&IUIAutomationElement>)->bool{
+    !ACTION_EXECUTING.load(SeqCst)&&sender.map(|e|unsafe{e.CurrentIsPassword().map(|v|!v.as_bool()).unwrap_or(false)}).unwrap_or(false)
+}
+
 /// Safely extract element role from UIA callback sender.
 fn sender_role(sender: Option<&IUIAutomationElement>) -> String {
     sender.and_then(|e| unsafe { e.CurrentControlType().ok() })
@@ -806,6 +803,7 @@ impl IUIAutomationEventHandler_Impl for DsEventHandler_Impl {
         sender: Option<&IUIAutomationElement>,
         eventid: UIA_EVENT_ID,
     ) -> windows::core::Result<()> {
+        if !event_sender_allowed(sender){return Ok(());}
         let name = sender_name(sender);
         let role = sender_role(sender);
         let event_name = match eventid.0 {
@@ -837,6 +835,7 @@ impl IUIAutomationPropertyChangedEventHandler_Impl for DsPropertyHandler_Impl {
         propertyid: UIA_PROPERTY_ID,
         newvalue: &VARIANT,
     ) -> windows::core::Result<()> {
+        if !event_sender_allowed(sender){return Ok(());}
         let name = sender_name(sender);
         let role = sender_role(sender);
         let prop_name = match propertyid.0 {
@@ -844,10 +843,14 @@ impl IUIAutomationPropertyChangedEventHandler_Impl for DsPropertyHandler_Impl {
             30045 => "Value",
             30086 => "ToggleState",
             30010 => "IsEnabled",
+            id if id==UIA_ScrollHorizontalScrollPercentPropertyId.0=>"HorizontalScrollPercent",
+            id if id==UIA_ScrollVerticalScrollPercentPropertyId.0=>"VerticalScrollPercent",
             _ => "unknown",
         };
         // Extract value from VARIANT (windows-rs 0.58 safe API)
-        let val_str = if let Ok(s) = BSTR::try_from(newvalue) {
+        let val_str = if matches!(prop_name,"HorizontalScrollPercent"|"VerticalScrollPercent") {
+            f64::try_from(newvalue).map(|v|v.to_string()).unwrap_or_default()
+        } else if let Ok(s) = BSTR::try_from(newvalue) {
             s.to_string()
         } else if let Ok(i) = i32::try_from(newvalue) {
             format!("{}", i)
@@ -874,6 +877,7 @@ impl IUIAutomationStructureChangedEventHandler_Impl for DsStructureHandler_Impl 
         changetype: StructureChangeType,
         _runtimeid: *const SAFEARRAY,
     ) -> windows::core::Result<()> {
+        if !event_sender_allowed(sender){return Ok(());}
         let name = sender_name(sender);
         let role = sender_role(sender);
         let change_name = match changetype.0 {
@@ -901,7 +905,7 @@ impl IUIAutomationStructureChangedEventHandler_Impl for DsStructureHandler_Impl 
 unsafe fn register_event_handlers(target: HWND) {
     log("register_events: starting...");
 
-    let uia: IUIAutomation = match CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER) {
+    let uia = match automation_client::create() {
         Ok(u) => u,
         Err(e) => { log(&format!("register_events: CoCreate FAIL: {e}")); return; }
     };
@@ -929,6 +933,8 @@ unsafe fn register_event_handlers(target: HWND) {
         UIA_PROPERTY_ID(30045), // Value
         UIA_PROPERTY_ID(30086), // ToggleState
         UIA_PROPERTY_ID(30010), // IsEnabled
+        UIA_ScrollHorizontalScrollPercentPropertyId,
+        UIA_ScrollVerticalScrollPercentPropertyId,
     ];
     match uia.AddPropertyChangedEventHandlerNativeArray(&root, scope, None, &prop_handler, &prop_ids) {
         Ok(_) => log("register_events: property handler OK"),
@@ -1069,31 +1075,9 @@ fn generate_a11y(db_path: &str) {
     lines.push(format!("# Window: {}", title));
     lines.push(String::new());
 
-    // 1. Focus — single live UIA call
-    lines.push("## Focus".to_string());
-    unsafe {
-        if let Ok(uia) = CoCreateInstance::<_, IUIAutomation>(
-            &CUIAutomation8, None, CLSCTX_INPROC_SERVER,
-        ) {
-            if let Ok(fe) = uia.GetFocusedElement() {
-                let fname = fe.CurrentName().ok().map(|s| s.to_string()).unwrap_or_default();
-                let fct = fe.CurrentControlType().unwrap_or_default();
-                let frole = role_name(fct.0);
-                let ftool = input_tool(frole).unwrap_or("interact");
-                let frect = fe.CurrentBoundingRectangle().unwrap_or_default();
-                let fval = get_value(&fe);
-                lines.push(format!("[{}] \"{}\" @ {},{} ({}x{})",
-                    ftool, fname, frect.left, frect.top,
-                    frect.right - frect.left, frect.bottom - frect.top));
-                if !fval.is_empty() {
-                    let preview = if fval.len() > 100 { &fval[..100] } else { &fval };
-                    lines.push(format!("  value: \"{}\"", preview));
-                }
-            } else {
-                lines.push("(none)".to_string());
-            }
-        }
-    }
+    // Windows keyboard focus may belong to the user in another app. Never read it here.
+    lines.push("## Agent target".to_string());
+    lines.push("Select a named field with ds_click or ds_text; Windows focus is independent.".to_string());
     lines.push(String::new());
 
     // 2. Input Targets — from DB (Edit/Document with name + value)
@@ -1238,659 +1222,63 @@ fn generate_a11y_snap(db_path: &str) {
     let _ = fs::write(&snap_path, &content);
 }
 
-// ── Injection Pipeline (External → App) ─────────────
-
-/// Inject text into the target app — screen reader style.
-/// Reads .a11y.snap to know WHAT can be operated.
-/// `target_name`: element name from .a11y.snap (e.g. "Einen Prompt für Gemini eingeben")
-///   If empty: falls back to first focusable+value element (legacy).
-unsafe fn inject_text(target: HWND, text: &str, target_name: &str) -> bool {
-    let uia: IUIAutomation = match CoCreateInstance(
-        &CUIAutomation8, None, CLSCTX_INPROC_SERVER,
-    ) {
-        Ok(u) => u,
-        Err(e) => { log(&format!("inject: CoCreate FAIL: {e}")); return false; }
-    };
-
-    let root = match uia.ElementFromHandle(target) {
-        Ok(e) => e,
-        Err(e) => { log(&format!("inject: ElementFromHandle FAIL: {e}")); return false; }
-    };
-
-    // Base conditions: focusable + accepts value
-    let cond_focus = match uia.CreatePropertyCondition(
-        UIA_IsKeyboardFocusablePropertyId, &VARIANT::from(true),
-    ) {
-        Ok(c) => c,
-        Err(e) => { log(&format!("inject: cond_focus FAIL: {e}")); return false; }
-    };
-    let cond_value = match uia.CreatePropertyCondition(
-        UIA_IsValuePatternAvailablePropertyId, &VARIANT::from(true),
-    ) {
-        Ok(c) => c,
-        Err(e) => { log(&format!("inject: cond_value FAIL: {e}")); return false; }
-    };
-    let base_cond = match uia.CreateAndCondition(&cond_focus, &cond_value) {
-        Ok(c) => c,
-        Err(e) => { log(&format!("inject: AndCondition FAIL: {e}")); return false; }
-    };
-
-    // If target_name given: add Name condition for precision targeting
-    let cond: IUIAutomationCondition = if !target_name.is_empty() {
-        let cond_name = match uia.CreatePropertyCondition(
-            UIA_NamePropertyId, &VARIANT::from(BSTR::from(target_name)),
-        ) {
-            Ok(c) => c,
-            Err(e) => { log(&format!("inject: cond_name FAIL: {e}")); return false; }
-        };
-        match uia.CreateAndCondition(&base_cond, &cond_name) {
-            Ok(c) => c.cast().unwrap(),
-            Err(e) => { log(&format!("inject: name+base FAIL: {e}")); return false; }
-        }
-    } else {
-        base_cond.cast().unwrap()
-    };
-
-    let elem = match root.FindFirst(TreeScope_Descendants, &cond) {
-        Ok(e) => e,
-        Err(e) => {
-            log(&format!("inject: FindFirst FAIL (target='{}'): {e}", target_name));
-            return false;
-        }
-    };
-
-    let name = elem.CurrentName().ok().map(|s| s.to_string()).unwrap_or_default();
-    let ct = elem.CurrentControlType().unwrap_or_default();
-    log(&format!("inject: target='{}' ct={}", name, ct.0));
-
-    // Focus it — like a screen reader navigating with Tab
-    let _ = elem.SetFocus();
-
-    // Strategy 1: ValuePattern (direct text set)
-    if let Ok(pat) = elem.GetCurrentPattern(UIA_ValuePatternId) {
-        if let Ok(vp) = pat.cast::<IUIAutomationValuePattern>() {
-            let current = vp.CurrentValue().ok()
-                .map(|s| s.to_string()).unwrap_or_default();
-            let combined = format!("{}{}", current, text);
-            let bstr = BSTR::from(combined.as_str());
-            if vp.SetValue(&bstr).is_ok() {
-                log(&format!("inject: ValuePattern OK, len={}", combined.len()));
-                return true;
-            }
-        }
-    }
-
-    // Strategy 2: SendInput — focus target first, then type
-    log("inject: ValuePattern failed, using SendInput");
-    let _ = SetForegroundWindow(target);
-    for ch in text.chars() {
-        inject_char(ch);
-    }
-    log("inject: SendInput done");
-    true
-}
-
-/// Map a key name to its VK code. Covers all 150+ keyboard keys.
-fn key_to_vk(name: &str) -> Option<VIRTUAL_KEY> {
-    match name.to_lowercase().as_str() {
-        // Letters
-        "a" => Some(VIRTUAL_KEY(0x41)), "b" => Some(VIRTUAL_KEY(0x42)),
-        "c" => Some(VIRTUAL_KEY(0x43)), "d" => Some(VIRTUAL_KEY(0x44)),
-        "e" => Some(VIRTUAL_KEY(0x45)), "f" => Some(VIRTUAL_KEY(0x46)),
-        "g" => Some(VIRTUAL_KEY(0x47)), "h" => Some(VIRTUAL_KEY(0x48)),
-        "i" => Some(VIRTUAL_KEY(0x49)), "j" => Some(VIRTUAL_KEY(0x4A)),
-        "k" => Some(VIRTUAL_KEY(0x4B)), "l" => Some(VIRTUAL_KEY(0x4C)),
-        "m" => Some(VIRTUAL_KEY(0x4D)), "n" => Some(VIRTUAL_KEY(0x4E)),
-        "o" => Some(VIRTUAL_KEY(0x4F)), "p" => Some(VIRTUAL_KEY(0x50)),
-        "q" => Some(VIRTUAL_KEY(0x51)), "r" => Some(VIRTUAL_KEY(0x52)),
-        "s" => Some(VIRTUAL_KEY(0x53)), "t" => Some(VIRTUAL_KEY(0x54)),
-        "u" => Some(VIRTUAL_KEY(0x55)), "v" => Some(VIRTUAL_KEY(0x56)),
-        "w" => Some(VIRTUAL_KEY(0x57)), "x" => Some(VIRTUAL_KEY(0x58)),
-        "y" => Some(VIRTUAL_KEY(0x59)), "z" => Some(VIRTUAL_KEY(0x5A)),
-        // Numbers
-        "0" => Some(VIRTUAL_KEY(0x30)), "1" => Some(VIRTUAL_KEY(0x31)),
-        "2" => Some(VIRTUAL_KEY(0x32)), "3" => Some(VIRTUAL_KEY(0x33)),
-        "4" => Some(VIRTUAL_KEY(0x34)), "5" => Some(VIRTUAL_KEY(0x35)),
-        "6" => Some(VIRTUAL_KEY(0x36)), "7" => Some(VIRTUAL_KEY(0x37)),
-        "8" => Some(VIRTUAL_KEY(0x38)), "9" => Some(VIRTUAL_KEY(0x39)),
-        // Function keys
-        "f1"  => Some(VK_F1),  "f2"  => Some(VK_F2),  "f3"  => Some(VK_F3),
-        "f4"  => Some(VK_F4),  "f5"  => Some(VK_F5),  "f6"  => Some(VK_F6),
-        "f7"  => Some(VK_F7),  "f8"  => Some(VK_F8),  "f9"  => Some(VK_F9),
-        "f10" => Some(VK_F10), "f11" => Some(VK_F11), "f12" => Some(VK_F12),
-        // Modifiers
-        "ctrl" | "control" => Some(VK_CONTROL),
-        "alt" | "menu"     => Some(VK_MENU),
-        "shift"            => Some(VK_SHIFT),
-        "win" | "lwin"     => Some(VK_LWIN),
-        "rwin"             => Some(VK_RWIN),
-        // Navigation
-        "enter" | "return" => Some(VK_RETURN),
-        "tab"              => Some(VK_TAB),
-        "escape" | "esc"   => Some(VK_ESCAPE),
-        "space"            => Some(VK_SPACE),
-        "backspace" | "bs" => Some(VK_BACK),
-        "delete" | "del"   => Some(VK_DELETE),
-        "insert" | "ins"   => Some(VK_INSERT),
-        "home"             => Some(VK_HOME),
-        "end"              => Some(VK_END),
-        "pageup" | "pgup"  => Some(VK_PRIOR),
-        "pagedown" | "pgdn"=> Some(VK_NEXT),
-        // Arrow keys
-        "up"    => Some(VK_UP),
-        "down"  => Some(VK_DOWN),
-        "left"  => Some(VK_LEFT),
-        "right" => Some(VK_RIGHT),
-        // Special keys
-        "printscreen" | "prtsc" => Some(VK_SNAPSHOT),
-        "scrolllock"            => Some(VK_SCROLL),
-        "pause" | "break"       => Some(VK_PAUSE),
-        "numlock"               => Some(VK_NUMLOCK),
-        "capslock" | "caps"     => Some(VK_CAPITAL),
-        // Punctuation / symbols
-        ";" | "semicolon"       => Some(VK_OEM_1),
-        "=" | "equals"          => Some(VK_OEM_PLUS),
-        "," | "comma"           => Some(VK_OEM_COMMA),
-        "-" | "minus"           => Some(VK_OEM_MINUS),
-        "." | "period"          => Some(VK_OEM_PERIOD),
-        "/" | "slash"           => Some(VK_OEM_2),
-        "`" | "backtick"        => Some(VK_OEM_3),
-        "[" | "lbracket"        => Some(VK_OEM_4),
-        "\\" | "backslash"      => Some(VK_OEM_5),
-        "]" | "rbracket"        => Some(VK_OEM_6),
-        "'" | "quote"           => Some(VK_OEM_7),
-        // Numpad
-        "num0" => Some(VK_NUMPAD0), "num1" => Some(VK_NUMPAD1),
-        "num2" => Some(VK_NUMPAD2), "num3" => Some(VK_NUMPAD3),
-        "num4" => Some(VK_NUMPAD4), "num5" => Some(VK_NUMPAD5),
-        "num6" => Some(VK_NUMPAD6), "num7" => Some(VK_NUMPAD7),
-        "num8" => Some(VK_NUMPAD8), "num9" => Some(VK_NUMPAD9),
-        "multiply" | "num*" => Some(VK_MULTIPLY),
-        "add"      | "num+" => Some(VK_ADD),
-        "subtract" | "num-" => Some(VK_SUBTRACT),
-        "decimal"  | "num." => Some(VK_DECIMAL),
-        "divide"   | "num/" => Some(VK_DIVIDE),
-        // Media
-        "volumeup"   => Some(VK_VOLUME_UP),
-        "volumedown" => Some(VK_VOLUME_DOWN),
-        "volumemute" => Some(VK_VOLUME_MUTE),
-        "nexttrack"  => Some(VK_MEDIA_NEXT_TRACK),
-        "prevtrack"  => Some(VK_MEDIA_PREV_TRACK),
-        "playpause"  => Some(VK_MEDIA_PLAY_PAUSE),
-        "stop"       => Some(VK_MEDIA_STOP),
-        _ => None,
-    }
-}
-
-/// Extended flag needed for certain keys (arrows, ins/del/home/end/pgup/pgdn, numlock, right-ctrl/alt)
-fn is_extended_key(vk: VIRTUAL_KEY) -> bool {
-    matches!(vk, VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT
-        | VK_INSERT | VK_DELETE | VK_HOME | VK_END | VK_PRIOR | VK_NEXT
-        | VK_NUMLOCK | VK_SNAPSHOT | VK_RWIN
-        | VK_DIVIDE)
-}
-
-/// Send a single VK key down+up via SendInput
-unsafe fn send_vk(vk: VIRTUAL_KEY) {
-    let ext = if is_extended_key(vk) { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) };
-    let inputs = [
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: vk, wScan: 0,
-                    dwFlags: ext,
-                    time: 0, dwExtraInfo: 0,
-                },
-            },
-        },
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: vk, wScan: 0,
-                    dwFlags: ext | KEYEVENTF_KEYUP,
-                    time: 0, dwExtraInfo: 0,
-                },
-            },
-        },
-    ];
-    SendInput(&inputs, mem::size_of::<INPUT>() as i32);
-}
-
-/// Send a VK modifier key DOWN only
-unsafe fn send_vk_down(vk: VIRTUAL_KEY) {
-    let ext = if is_extended_key(vk) { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) };
-    let input = [INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: vk, wScan: 0,
-                dwFlags: ext,
-                time: 0, dwExtraInfo: 0,
-            },
-        },
-    }];
-    SendInput(&input, mem::size_of::<INPUT>() as i32);
-}
-
-/// Send a VK modifier key UP only
-unsafe fn send_vk_up(vk: VIRTUAL_KEY) {
-    let ext = if is_extended_key(vk) { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) };
-    let input = [INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: vk, wScan: 0,
-                dwFlags: ext | KEYEVENTF_KEYUP,
-                time: 0, dwExtraInfo: 0,
-            },
-        },
-    }];
-    SendInput(&input, mem::size_of::<INPUT>() as i32);
-}
-
-/// Parse and send a key combo like "ctrl+shift+a" or "enter" or "f5"
-/// Supports any combination of modifiers + one main key.
-/// Uses SendInput (global) — used by keyboard hook where target is already focused.
-unsafe fn send_key_combo(combo: &str) {
-    let parts: Vec<&str> = combo.split('+').map(|s| s.trim()).collect();
-    let mut modifiers: Vec<VIRTUAL_KEY> = Vec::new();
-    let mut main_key: Option<VIRTUAL_KEY> = None;
-
-    for part in &parts {
-        if let Some(vk) = key_to_vk(part) {
-            if matches!(vk, VK_CONTROL | VK_MENU | VK_SHIFT | VK_LWIN | VK_RWIN) {
-                modifiers.push(vk);
-            } else {
-                main_key = Some(vk);
-            }
-        } else {
-            log(&format!("key: unknown key '{}'", part));
-            return;
-        }
-    }
-
-    // Press modifiers down
-    for &m in &modifiers { send_vk_down(m); }
-    // Press main key (or if only modifier, press the last modifier as key)
-    if let Some(mk) = main_key {
-        send_vk(mk);
-    }
-    // Release modifiers in reverse
-    for &m in modifiers.iter().rev() { send_vk_up(m); }
-
-    log(&format!("key: sent '{}'", combo));
-}
-
-/// Click on a UI element by name using UIA. Finds element, gets center, sends mouse click.
-unsafe fn click_element(target_hwnd: HWND, element_name: &str) -> bool {
-    let uia: IUIAutomation = match CoCreateInstance(
-        &CUIAutomation8, None, CLSCTX_INPROC_SERVER,
-    ) {
-        Ok(u) => u,
-        Err(e) => { log(&format!("click: CoCreate FAIL: {e}")); return false; }
-    };
-
-    let root = match uia.ElementFromHandle(target_hwnd) {
-        Ok(e) => e,
-        Err(e) => { log(&format!("click: ElementFromHandle FAIL: {e}")); return false; }
-    };
-
-    let cond = match uia.CreatePropertyCondition(
-        UIA_NamePropertyId, &VARIANT::from(BSTR::from(element_name)),
-    ) {
-        Ok(c) => c,
-        Err(e) => { log(&format!("click: cond FAIL: {e}")); return false; }
-    };
-
-    let elem = match root.FindFirst(TreeScope_Descendants, &cond) {
-        Ok(e) => e,
-        Err(e) => {
-            log(&format!("click: FindFirst FAIL ('{}'): {e}", element_name));
-            return false;
-        }
-    };
-
-    // Native mouse click via SendInput — always.
-    // UIA InvokePattern is synchronous cross-process COM → deadlocks Electron apps (Discord).
-    // We only use UIA to FIND the element coordinates, then click with real mouse input.
-    // Bring target to foreground first — SendInput goes to the foreground window.
-    let _ = SetForegroundWindow(target_hwnd);
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    let rect = match elem.CurrentBoundingRectangle() {
-        Ok(r) => r,
-        Err(e) => { log(&format!("click: rect FAIL: {e}")); return false; }
-    };
-    let cx = rect.left + (rect.right - rect.left) / 2;
-    let cy = rect.top + (rect.bottom - rect.top) / 2;
-    let screen_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    let screen_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    let screen_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    let screen_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    let abs_x = ((cx - screen_x) * 65535 / screen_w) as i32;
-    let abs_y = ((cy - screen_y) * 65535 / screen_h) as i32;
-    let vd_flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
-    let inputs = [
-        INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: abs_x, dy: abs_y, mouseData: 0,
-                    dwFlags: vd_flags | MOUSEEVENTF_LEFTDOWN,
-                    time: 0, dwExtraInfo: 0,
-                },
-            },
-        },
-        INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: abs_x, dy: abs_y, mouseData: 0,
-                    dwFlags: vd_flags | MOUSEEVENTF_LEFTUP,
-                    time: 0, dwExtraInfo: 0,
-                },
-            },
-        },
-    ];
-    SendInput(&inputs, mem::size_of::<INPUT>() as i32);
-    // Auto-persist: remember last click coordinates for re-focus before type/key
-    LAST_CLICK_X.store(abs_x, SeqCst);
-    LAST_CLICK_Y.store(abs_y, SeqCst);
-    log(&format!("click: SendInput '{}' @ {},{} (persisted)", element_name, cx, cy));
-    true
-}
-
-/// Scroll the target window (up/down/left/right)
-unsafe fn scroll_window(target_hwnd: HWND, direction: &str) {
-    let (dx, dy): (i32, i32) = match direction.to_lowercase().as_str() {
-        "up"    => (0, 120),    // WHEEL_DELTA = 120
-        "down"  => (0, -120),
-        "left"  => (-120, 0),
-        "right" => (120, 0),
-        _ => { log(&format!("scroll: unknown direction '{}'", direction)); return; }
-    };
-
-    // Get center of target window for scroll position
-    let mut rect = RECT::default();
-    let _ = GetWindowRect(target_hwnd, &mut rect);
-    let cx = rect.left + (rect.right - rect.left) / 2;
-    let cy = rect.top + (rect.bottom - rect.top) / 2;
-
-    let screen_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    let screen_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    let screen_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-    let screen_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    let abs_x = ((cx - screen_x) * 65535 / screen_w) as i32;
-    let abs_y = ((cy - screen_y) * 65535 / screen_h) as i32;
-    let vd_flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
-
-    if dy != 0 {
-        let input = [INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: abs_x, dy: abs_y,
-                    mouseData: dy as u32,
-                    dwFlags: vd_flags | MOUSEEVENTF_WHEEL,
-                    time: 0, dwExtraInfo: 0,
-                },
-            },
-        }];
-        SendInput(&input, mem::size_of::<INPUT>() as i32);
-    }
-    if dx != 0 {
-        let input = [INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: abs_x, dy: abs_y,
-                    mouseData: dx as u32,
-                    dwFlags: vd_flags | MOUSEEVENTF_HWHEEL,
-                    time: 0, dwExtraInfo: 0,
-                },
-            },
-        }];
-        SendInput(&input, mem::size_of::<INPUT>() as i32);
-    }
-    log(&format!("scroll: {}", direction));
-}
-
-/// Process the action queue. Dispatches: text, key, click, scroll.
-/// Only runs when target app has foreground focus — won't steal focus from user.
+// One background COM worker owns semantic actions; user focus is never a target.
+static ACTION_BUSY: AtomicBool = AtomicBool::new(false);
 fn process_injections() {
-    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    // Re-entry guard: COM calls in click_element can pump messages,
-    // causing WM_TIMER to fire re-entrantly. This prevents double execution.
-    if BUSY.swap(true, SeqCst) { return; }
-
+    static WORKER: std::sync::OnceLock<std::sync::mpsc::Sender<(String,isize)>>=std::sync::OnceLock::new();
+    if ACTION_BUSY.swap(true, SeqCst) { return; }
     let db_path = get_db_path();
-    if db_path.is_empty() { BUSY.store(false, SeqCst); return; }
+    let window = TARGET_HW.load(SeqCst);
+    if db_path.is_empty() || window == 0 { ACTION_BUSY.store(false, SeqCst); return; }
+    let worker=WORKER.get_or_init(||{
+        let (tx,rx)=std::sync::mpsc::channel::<(String,isize)>();
+        std::thread::spawn(move || unsafe {
+            let initialized=CoInitializeEx(None,COINIT_MULTITHREADED).is_ok();
+            // Keep the apartment and its UIA client alive across calls. Remote
+            // providers may bind their lifetime to the originating apartment.
+            let client=if initialized{automation_client::create().ok()}else{None};
+            let mut selection=native_actions::AgentSelection{window:0,name:String::new(),replace_all:false};
+            for (db_path,window) in rx {
+                process_one_injection(db_path,window,&mut selection,client.as_ref());
+            }
+            drop(client);
+            if initialized{CoUninitialize();}
+        });
+        tx
+    });
+    if worker.send((db_path,window)).is_err(){ACTION_BUSY.store(false,SeqCst);}
+}
 
-    let conn = match Connection::open(&db_path) {
-        Ok(c) => c,
-        Err(_) => { BUSY.store(false, SeqCst); return; },
-    };
-    let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=500;");
-
-    // Read ONE pending action (FIFO)
-    let row: Option<(i64, String, String, String)> = conn
-        .query_row(
-            "SELECT id, COALESCE(action,'text'), text, COALESCE(target,'') \
-             FROM inject WHERE done=0 ORDER BY id LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .ok();
-
-    if let Some((id, action, text, target_name)) = row {
-        // Claim action — if DB is locked, bail out and retry next timer tick (30ms)
-        if conn.execute("UPDATE inject SET done=1 WHERE id=?1", params![id]).is_err() {
-            BUSY.store(false, SeqCst);
-            return;
-        }
-
-        log(&format!("action: id={} type='{}' target='{}' text='{}'",
-            id, action, target_name, if text.len() > 50 { &text[..50] } else { &text }));
-
-        // No auto-focus: actions work via UIA patterns and PostMessage,
-        // independent of which window the user has in foreground.
-
-        let ok = unsafe {
-            let target = HWND(TARGET_HW.load(SeqCst) as *mut _);
-            if target.0.is_null() && action != "key" {
-                log("action: no target window");
-                false
+fn process_one_injection(db_path:String,window:isize,selection:&mut native_actions::AgentSelection,client:Option<&IUIAutomation>){
+        struct ReleaseBusy;
+        impl Drop for ReleaseBusy { fn drop(&mut self) { ACTION_BUSY.store(false, SeqCst); } }
+        let _release = ReleaseBusy;
+        let Ok(conn) = Connection::open(&db_path) else { return; };
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(500));
+        let clock = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        let _ = conn.execute("UPDATE inject SET done=2,outcome='EXPIRED_BEFORE_EXECUTION' WHERE done=0 AND expires_at<=?1", [clock()]);
+        let row: rusqlite::Result<(i64,String,String,String)> = conn.query_row(
+            "SELECT id,action,text,target FROM inject WHERE done=0 ORDER BY id LIMIT 1", [],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)));
+        let Ok((id,action,text,name)) = row else { return; };
+        if conn.execute("UPDATE inject SET done=3 WHERE id=?1 AND done=0 AND expires_at>?2",params![id,clock()]).unwrap_or(0)!=1 { return; }
+        ACTION_EXECUTING.store(true,SeqCst);
+        struct ReleaseExecution;
+        impl Drop for ReleaseExecution{fn drop(&mut self){ACTION_EXECUTING.store(false,SeqCst);}}
+        let _execution=ReleaseExecution;
+        let Ok(_access)=AUTOMATION_GATE.lock() else{return;};
+        let result = unsafe {
+            let target = HWND(window as *mut _);
+            if TARGET_HW.load(SeqCst)!=window || !attia::allowed_target(target) {
+                Err("TARGET_CHANGED_OR_DENIED".to_string())
+            } else if let Some(client)=client {
+                native_actions::execute_on(client,target,&action,&text,&name,selection)
             } else {
-                match action.as_str() {
-                    "text" => inject_text(target, &text, &target_name),
-                    "type" => {
-                        // Auto-persist: ALWAYS re-click last known focus before typing
-                        let lx = LAST_CLICK_X.load(SeqCst);
-                        let ly = LAST_CLICK_Y.load(SeqCst);
-                        if lx >= 0 && ly >= 0 {
-                            let _ = SetForegroundWindow(target);
-                            std::thread::sleep(std::time::Duration::from_millis(30));
-                            let vdf = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_MOVE;
-                            let refocus = [
-                                INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: lx, dy: ly, mouseData: 0, dwFlags: vdf | MOUSEEVENTF_LEFTDOWN, time: 0, dwExtraInfo: 0 } } },
-                                INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: lx, dy: ly, mouseData: 0, dwFlags: vdf | MOUSEEVENTF_LEFTUP, time: 0, dwExtraInfo: 0 } } },
-                            ];
-                            SendInput(&refocus, mem::size_of::<INPUT>() as i32);
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                            log(&format!("type: re-focus @ abs({},{})", lx, ly));
-                        }
-                        log(&format!("type: BEGIN SendInput {} chars", text.len()));
-                        let mut aborted = false;
-                        for (i, ch) in text.chars().enumerate() {
-                            // Fail-safe: abort if target lost foreground focus
-                            let fg = GetForegroundWindow();
-                            if fg != target && !target.0.is_null() {
-                                log(&format!("type: ABORT at char[{}] — focus lost (fg=0x{:X} target=0x{:X})", i, fg.0 as usize, target.0 as usize));
-                                aborted = true;
-                                break;
-                            }
-                            match ch {
-                                '\t' => send_vk(VK_TAB),
-                                '\n' | '\r' => send_vk(VK_RETURN),
-                                _ => inject_char(ch),
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                        }
-                        if aborted {
-                            log("type: ABORTED — focus lost mid-typing");
-                        } else {
-                            log(&format!("type: ALL {} CHARS DONE", text.len()));
-                        }
-                        !aborted
-                    },
-                    "key"  => {
-                        // No re-click! Key actions must preserve selection state (ctrl+a → backspace)
-                        // Only bring window to foreground, don't click into it
-                        let _ = SetForegroundWindow(target);
-                        send_key_combo(&text);
-                        true
-                    },
-                    "click" => {
-                        log(&format!("click: BEGIN '{}'", target_name));
-                        let r = click_element(target, &target_name);
-                        log(&format!("click: END '{}' result={}", target_name, r));
-                        r
-                    },
-                    "scroll" => {
-                        // Real scroll via SendInput — same as scroll_window()
-                        scroll_window(target, &text);
-                        true
-                    },
-                    _ => { log(&format!("action: unknown type '{}'", action)); false }
-                }
+                Err("UIA_COM_INITIALIZATION_FAILED".to_string())
             }
         };
-
-        if ok {
-            log(&format!("action: done id={}", id));
-        } else {
-            let _ = conn.execute("UPDATE inject SET done=0 WHERE id=?1", params![id]);
-            log(&format!("action: FAILED id={} — will retry", id));
-        }
-    }
-    BUSY.store(false, SeqCst);
-}
-
-// ── Keyboard Hook (Input Proxy) ─────────────────────
-
-/// Inject a single Unicode character into the focused window via SendInput
-unsafe fn inject_char(ch: char) {
-    let code = ch as u16;
-    let inputs = [
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0),
-                    wScan: code,
-                    dwFlags: KEYEVENTF_UNICODE,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        },
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VIRTUAL_KEY(0),
-                    wScan: code,
-                    dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        },
-    ];
-    SendInput(&inputs, mem::size_of::<INPUT>() as i32);
-}
-
-/// Low-level keyboard hook callback
-/// Intercepts keystrokes when snapped + target has focus.
-/// Blocks the original, transforms the character, injects the result.
-unsafe extern "system" fn kb_hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let hook = HHOOK(KB_HOOK.load(SeqCst) as *mut _);
-
-    // Negative code = must pass through per contract
-    if code < 0 {
-        return CallNextHookEx(hook, code, wp, lp);
-    }
-
-    // Only intercept when snapped
-    if !snapped() {
-        return CallNextHookEx(hook, code, wp, lp);
-    }
-
-    let kbd = &*(lp.0 as *const KBDLLHOOKSTRUCT);
-
-    // Skip injected keys (our own output) — LLKHF_INJECTED = 0x10
-    if kbd.flags.0 & 0x10 != 0 {
-        return CallNextHookEx(hook, code, wp, lp);
-    }
-
-    // Only intercept when target app has focus
-    let fg = GetForegroundWindow();
-    let target = tgt();
-    if target.0.is_null() {
-        return CallNextHookEx(hook, code, wp, lp);
-    }
-    if fg != target && GetAncestor(fg, GA_ROOT) != target {
-        return CallNextHookEx(hook, code, wp, lp);
-    }
-
-    // Preserve Ctrl/Alt shortcuts (copy, paste, undo, etc.)
-    if GetAsyncKeyState(VK_CONTROL.0 as i32) < 0 || GetAsyncKeyState(VK_MENU.0 as i32) < 0 {
-        return CallNextHookEx(hook, code, wp, lp);
-    }
-
-    let msg = wp.0 as u32;
-    let vk = kbd.vkCode;
-
-    // Non-character keys — ALWAYS pass through, no ToUnicode needed
-    let vk_key = VIRTUAL_KEY(vk as u16);
-    if matches!(vk_key,
-        VK_RETURN | VK_BACK | VK_TAB | VK_ESCAPE | VK_DELETE | VK_INSERT |
-        VK_HOME | VK_END | VK_PRIOR | VK_NEXT |
-        VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT |
-        VK_F1 | VK_F2 | VK_F3 | VK_F4 | VK_F5 | VK_F6 |
-        VK_F7 | VK_F8 | VK_F9 | VK_F10 | VK_F11 | VK_F12
-    ) {
-        return CallNextHookEx(hook, code, wp, lp);
-    }
-
-    // Build keyboard state for ToUnicode
-    let mut kb_state = [0u8; 256];
-    if GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 { kb_state[0x10] = 0x80; }
-    if GetAsyncKeyState(VK_LSHIFT.0 as i32) < 0 { kb_state[0xA0] = 0x80; }
-    if GetAsyncKeyState(VK_RSHIFT.0 as i32) < 0 { kb_state[0xA1] = 0x80; }
-    if GetAsyncKeyState(VK_CAPITAL.0 as i32) & 1 != 0 { kb_state[0x14] = 0x01; }
-
-    // Try converting virtual key → Unicode character
-    let mut buf = [0u16; 4];
-    // Flag 0x4 = do not modify keyboard state (preserve dead keys like ^ ´ `)
-    let n = ToUnicode(vk, kbd.scanCode, Some(&kb_state), &mut buf, 0x4);
-
-    // n <= 0 = dead key or no translation → pass through
-    if n <= 0 {
-        return CallNextHookEx(hook, code, wp, lp);
-    }
-
-    // It's a printable character — intercept it
-    if msg == WM_KEYDOWN {
-        for i in 0..n as usize {
-            if let Some(ch) = char::from_u32(buf[i] as u32) {
-                inject_char(ch);
-            }
-        }
-    }
-    // Block both WM_KEYDOWN and WM_KEYUP for intercepted keys
-    LRESULT(1)
+        let (done,outcome) = match result { Ok(message)=>(1,message),Err(message)=>(2,message) };
+        let _ = conn.execute("UPDATE inject SET done=?2,outcome=?3 WHERE id=?1 AND done=3",params![id,done,outcome]);
 }
 
 // ── Snap-Ziel finden ────────────────────────────────
@@ -1913,6 +1301,7 @@ unsafe fn find_snap(me: HWND) -> Option<HWND> {
 
 // ── Snap / Unsnap ───────────────────────────────────
 unsafe fn do_snap(me: HWND, target: HWND) {
+    if attia::enabled() && !attia::allowed_target(target) { return; }
     log(&format!("do_snap: me=0x{:X} target=0x{:X}", me.0 as usize, target.0 as usize));
 
     let mut rc = RECT::default();
@@ -2018,6 +1407,7 @@ unsafe fn get_visible_windows() -> Vec<WindowInfo> {
         if !IsWindowVisible(hwnd).as_bool() { continue; }
         if !ds.0.is_null() && hwnd == ds { continue; }
         if is_shell(hwnd) { continue; }
+        if attia::enabled() && !attia::allowed_target(hwnd) { continue; }
         let mut buf = [0u16; 256];
         let len = GetWindowTextW(hwnd, &mut buf);
         if len == 0 { continue; }
@@ -2096,15 +1486,22 @@ unsafe fn check_snap_request(me: HWND) {
     log(&format!("snap_request: looking for '{}'", requested));
 
     let windows = get_visible_windows();
-    let target_hwnd = windows.iter().find(|w| w.app == requested).map(|w| w.hwnd);
+    let exact: Vec<_> = windows.iter().filter(|w| w.app==requested || get_exe_name(w.pid).trim_end_matches(".exe").eq_ignore_ascii_case(&requested) || w.title.eq_ignore_ascii_case(&requested)).collect();
+    let candidates: Vec<_> = if exact.is_empty() { windows.iter().filter(|w| w.title.to_lowercase().contains(&requested)).collect() } else { exact };
+    if candidates.len()>1 {
+        let _=fs::write(SNAP_RESULT_FILE,r#"{"status":"error","reason":"Multiple matching windows. Use an exact title from ds_apps; no arbitrary selection."}"#);
+        return;
+    }
+    let target_hwnd = candidates.first().map(|w|w.hwnd);
 
     match target_hwnd {
-        Some(target) => {
+        Some(target) if !attia::enabled() || attia::allowed_target(target) => {
+            let selected_app=candidates[0].app.as_str();
             log(&format!("snap_request: found '{}' at 0x{:X}", requested, target.0 as usize));
             // Already snapped to this exact window?
             if snapped() && tgt() == target {
                 let _ = fs::write(SNAP_RESULT_FILE,
-                    format!(r#"{{"status":"ok","app":"{}"}}"#, requested));
+                    format!(r#"{{"status":"ok","app":"{}","hwnd":{}}}"#, json_escape(selected_app),target.0 as usize));
                 return;
             }
             if snapped() { do_unsnap(me); }
@@ -2113,12 +1510,12 @@ unsafe fn check_snap_request(me: HWND) {
             DAEMON_SNAP.store(false, SeqCst);
 
             let _ = fs::write(SNAP_RESULT_FILE,
-                format!(r#"{{"status":"ok","app":"{}"}}"#, requested));
+                format!(r#"{{"status":"ok","app":"{}","hwnd":{}}}"#, json_escape(selected_app),target.0 as usize));
         }
-        None => {
+        _ => {
             log(&format!("snap_request: '{}' NOT FOUND", requested));
             let _ = fs::write(SNAP_RESULT_FILE,
-                format!(r#"{{"status":"error","reason":"No window matching '{}' found"}}"#, requested));
+                format!(r#"{{"status":"error","reason":"No window matching '{}' found"}}"#, json_escape(&requested)));
         }
     }
 }
@@ -2156,21 +1553,13 @@ unsafe fn do_sync(me: HWND) {
     }
     let mut trc = RECT::default();
     let _ = GetWindowRect(t, &mut trc);
-    let mut prc = RECT::default();
-    let _ = GetWindowRect(me, &mut prc);
     let tp = (trc.left, trc.top, trc.right - trc.left, trc.bottom - trc.top);
-    let pp = (prc.left, prc.top, prc.right - prc.left, prc.bottom - prc.top);
     let sp = saved();
     if tp != sp {
         // Target hat sich bewegt → DirectShell folgt (Z-Order via Owner automatisch)
         let _ = SetWindowPos(me, HWND::default(), tp.0, tp.1, tp.2, tp.3,
             SWP_NOACTIVATE | SWP_NOZORDER);
         save(tp.0, tp.1, tp.2, tp.3);
-    } else if pp != sp {
-        // DirectShell hat sich bewegt → Target folgt
-        let _ = SetWindowPos(t, HWND::default(), pp.0, pp.1, pp.2, pp.3,
-            SWP_NOACTIVATE | SWP_NOZORDER);
-        save(pp.0, pp.1, pp.2, pp.3);
     }
 }
 
@@ -2476,8 +1865,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let _ = InsertMenuW(menu, 1, MF_SEPARATOR, 0, PCWSTR(sep_label.as_ptr()));
     let _ = InsertMenuW(menu, 2, MF_STRING, IDM_EXIT as usize, PCWSTR(exit_label.as_ptr()));
 
-    // Required: SetForegroundWindow before TrackPopupMenu so menu dismisses properly
-    let _ = SetForegroundWindow(hwnd);
+    // Never activate our window to display a tray menu.
     let mut pt = std::mem::zeroed();
     let _ = GetCursorPos(&mut pt);
     let _ = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, None);
@@ -2594,7 +1982,7 @@ unsafe extern "system" fn wndproc(
             log("WM_CLOSE received");
             if snapped() {
                 let t = tgt();
-                if !t.0.is_null() && IsWindow(t).as_bool() {
+                if !attia::enabled() && !t.0.is_null() && IsWindow(t).as_bool() {
                     let _ = PostMessageW(t, WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
                 do_unsnap(hwnd);
@@ -2606,11 +1994,6 @@ unsafe extern "system" fn wndproc(
 
         WM_DESTROY => {
             remove_tray_icon(hwnd);
-            let hk = KB_HOOK.swap(0, SeqCst);
-            if hk != 0 {
-                let _ = UnhookWindowsHookEx(HHOOK(hk as *mut _));
-                log("Keyboard hook removed");
-            }
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -2928,10 +2311,14 @@ unsafe fn check_browser_shortcuts() {
 }
 
 fn main() -> Result<()> {
+    if window_query::dispatch() { return Ok(()); }
+    attia::configure()?;
     // ── Single-Instance Guard ────────────────────────────────────────
     // Only one DirectShell may run at a time.
     // Window class "DirectShell" is unique — if it already exists, bail out.
-    if let Ok(existing) = unsafe { FindWindowW(w!("DirectShell"), None) } {
+    let private_class: Vec<u16> = format!("AttiaDirectShell-{}\0", std::process::id()).encode_utf16().collect();
+    let class_name = if attia::enabled() { PCWSTR(private_class.as_ptr()) } else { w!("DirectShell") };
+    if let Ok(existing) = unsafe { FindWindowW(class_name, None) } {
         if existing != HWND::default() {
             eprintln!("DirectShell is already running. Exiting.");
             std::process::exit(0);
@@ -2947,16 +2334,16 @@ fn main() -> Result<()> {
         log("COM initialized");
 
         // Browser-Verknüpfungen prüfen und ggf. CDP+UIA Flags anbieten
-        check_browser_shortcuts();
+        if !attia::enabled() { check_browser_shortcuts(); }
 
         // Screen Reader Flag SOFORT setzen — bevor irgendwas passiert.
         // Apps die NACH DirectShell starten sehen das Flag von Anfang an.
-        let _ = SystemParametersInfoW(
+        if !attia::enabled() { let _ = SystemParametersInfoW(
             SPI_SETSCREENREADER,
             1,
             None,
             SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0x0002),
-        );
+        ); }
         log("SPI_SETSCREENREADER = TRUE (global, at startup)");
 
         // Global WinEvent Hook — macht DS für ALLE Apps als Screen Reader sichtbar.
@@ -2979,7 +2366,7 @@ fn main() -> Result<()> {
 
         let inst = GetModuleHandleW(None)?;
         let hinst: HINSTANCE = inst.into();
-        let cls = w!("DirectShell");
+        let cls = class_name;
 
         // Load embedded icon for window class (taskbar + alt-tab)
         let app_icon = LoadImageW(hinst, PCWSTR(1 as *const u16), IMAGE_ICON, 0, 0, LR_DEFAULTCOLOR | LR_DEFAULTSIZE);
@@ -2999,9 +2386,9 @@ fn main() -> Result<()> {
         RegisterClassExW(&wc);
 
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST,
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
             cls, w!("DirectShell"),
-            WS_POPUP | WS_VISIBLE,
+            WS_POPUP,
             200, 200, 500, 350,
             HWND::default(), HMENU::default(), hinst, None,
         )?;
@@ -3019,10 +2406,10 @@ fn main() -> Result<()> {
         let _ = SetTimer(hwnd, SNAP_REQ_TIMER, SNAP_REQ_MS, None);
         log("Daemon mode: ENUM_TIMER + SNAP_REQ_TIMER started");
 
-        // Keyboard Hook installieren (global, low-level)
-        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(kb_hook_proc), hinst, 0)?;
-        KB_HOOK.store(hook.0 as isize, SeqCst);
-        log(&format!("Keyboard hook installed: 0x{:X}", hook.0 as usize));
+        // No keyboard interception, even in standalone mode.
+        AGENT_MODE.store(true, SeqCst);
+        let _ = fs::write(OVERLAY_MODE_FILE, "agent");
+        let _ = ShowWindow(hwnd, SW_HIDE);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {

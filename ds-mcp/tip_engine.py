@@ -158,6 +158,12 @@ class TipEngine:
 
         ctx = self._ctx
 
+        # A URL observation is metadata, not another successful MCP action.
+        if tool_name == '_url_sync':
+            ctx.url = params.get('url')
+            ctx.mode = 'browser'
+            return
+
         # Track tools
         ctx.last_tools.append(tool_name)
         ctx.last_params.append(params)

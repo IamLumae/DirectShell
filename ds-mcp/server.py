@@ -38,6 +38,7 @@ import re
 import socket
 import requests
 from pathlib import Path
+from contextlib import closing
 from typing import Optional
 
 from fastmcp import FastMCP
@@ -112,6 +113,7 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 
 _ACTION_LOG_DIR = PROFILES_DIR / "action_log"
+_EXTERNAL_LEARNING = False
 
 def _log_action(tool_name: str, params: dict, result: str, prev_ok: str):
     """Log an MCP action with success feedback from previous action. Never raises."""
@@ -176,14 +178,10 @@ def _read_active() -> dict:
 
 
 def _is_ds_running() -> bool:
-    """Check if DirectShell is alive by looking at the is_active file's age.
-    DS writes this file every few seconds. If it's stale (>10s) or missing, DS is dead."""
-    active_file = PROFILES_DIR / "is_active"
-    if not active_file.exists():
-        return False
+    """Check the daemon heartbeat, independent of whether an app is snapped."""
+    windows_file = PROFILES_DIR / "windows.json"
     try:
-        age = time.time() - active_file.stat().st_mtime
-        return age < 10  # DS writes this every ~2s; 10s = generous margin
+        return windows_file.exists() and time.time() - windows_file.stat().st_mtime < 10
     except Exception:
         return False
 
@@ -357,13 +355,25 @@ def _cdp_ws(tab_id: Optional[str] = None):
     if target_id:
         tab = next((t for t in tabs if t.get("id") == target_id and "webSocketDebuggerUrl" in t), None)
         if tab:
-            return _ws.create_connection(tab["webSocketDebuggerUrl"], timeout=5)
+            return _ws.create_connection(tab["webSocketDebuggerUrl"], timeout=5, suppress_origin=os.environ.get('ATTIA_DS_MODE') == '1')
 
     # Fallback: first page tab
     page_tab = next((t for t in tabs if t.get("type") == "page" and "webSocketDebuggerUrl" in t), None)
     if not page_tab:
         raise RuntimeError("No CDP page tab found")
-    return _ws.create_connection(page_tab["webSocketDebuggerUrl"], timeout=5)
+    return _ws.create_connection(page_tab["webSocketDebuggerUrl"], timeout=5, suppress_origin=os.environ.get('ATTIA_DS_MODE') == '1')
+
+
+def _cdp_response(ws, msg_id: int):
+    """Match the command acknowledgement, never mistake an event/error for success."""
+    for _ in range(1000):
+        response = json.loads(ws.recv())
+        if response.get('id') != msg_id:
+            continue
+        if response.get('error'):
+            raise RuntimeError('CDP rejected command: ' + str(response['error'].get('message', 'unknown error'))[:200])
+        return response
+    raise RuntimeError('CDP acknowledgement missing; execution unconfirmed.')
 
 
 def _cdp_dispatch_click(ws, x: float, y: float, click_count: int = 1, msg_id_base: int = 2) -> None:
@@ -372,20 +382,24 @@ def _cdp_dispatch_click(ws, x: float, y: float, click_count: int = 1, msg_id_bas
         ws.send(json.dumps({"id": eid, "method": "Input.dispatchMouseEvent", "params": {
             "type": method_type, "x": x, "y": y, "button": "left", "clickCount": click_count
         }}))
-        ws.recv()
+        _cdp_response(ws, eid)
 
 
 def _cdp_eval(ws, js: str, msg_id: int = 1):
     """Evaluate JS in the active page context and return the raw CDP response."""
     ws.send(json.dumps({"id": msg_id, "method": "Runtime.evaluate", "params": {"expression": js, "returnByValue": True}}))
-    return json.loads(ws.recv())
+    response = _cdp_response(ws, msg_id)
+    if response.get('result', {}).get('exceptionDetails'):
+        raise RuntimeError('CDP page evaluation failed; refresh the view.')
+    return response
 
 
 def _cdp_find_coords_for_tool(ws, tool: dict) -> Optional[dict]:
     """Try to find the element for a tool dict and return {x,y} or None.
 
-    Prefers tool["dsid"] (data-ds-mcp attribute), then tool["selector"].
-    Falls back to tool["x"], tool["y"] when available.
+    Observed DS identity is binding. If it disappeared, re-observe; never click
+    replacement elements or the old screen position. Selectors serve legacy
+    entries without a DS identity only.
     """
     dsid = tool.get("dsid") or ""
     selector = tool.get("selector") or ""
@@ -447,6 +461,8 @@ def _cdp_find_coords_for_tool(ws, tool: dict) -> Optional[dict]:
             except Exception:
                 pass
 
+        return None  # Identity vanished; a selector may now identify somebody else.
+
     # Find by selector in the top-level document only (selectors don't pierce shadow/iframe).
     if selector:
         safe = selector.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
@@ -466,22 +482,18 @@ def _cdp_find_coords_for_tool(ws, tool: dict) -> Optional[dict]:
             except Exception:
                 pass
 
-    # Fallback: stored coords from extraction (best-effort).
-    if isinstance(tool.get("x"), (int, float)) and isinstance(tool.get("y"), (int, float)):
-        return {"x": float(tool["x"]), "y": float(tool["y"])}
-
     return None
 
 
 def _cdp_click_tool(tool: dict) -> str:
     """Click a DOM element using a tool dict (stable id/selector/coords)."""
     ws = _cdp_ws()
-    coords = _cdp_find_coords_for_tool(ws, tool)
-    if not coords:
-        ws.close()
-        raise RuntimeError(f"CDP: '{tool.get('element', '?')}' not found")
-    _cdp_dispatch_click(ws, coords["x"], coords["y"], msg_id_base=10)
-    ws.close()
+    try:
+        coords = _cdp_find_coords_for_tool(ws, tool)
+        if not coords:
+            raise RuntimeError('CDP target is stale; call ds_update_view before choosing another action.')
+        _cdp_dispatch_click(ws, coords["x"], coords["y"], msg_id_base=10)
+    finally: ws.close()
     return "clicked"
 
 
@@ -670,12 +682,14 @@ def _cdp_type(text: str, target: str = "") -> str:
 def _cdp_key(combo: str) -> str:
     """Press a key combo via CDP Input.dispatchKeyEvent."""
     # Parse combo: "ctrl+shift+a" → modifiers + key
-    parts = combo.lower().split("+")
+    parts = [p.strip().replace('control', 'ctrl') for p in combo.lower().split("+")]
     key = parts[-1]
     modifiers = 0
     if "alt" in parts[:-1]: modifiers |= 1
     if "ctrl" in parts[:-1]: modifiers |= 2
     if "shift" in parts[:-1]: modifiers |= 8
+    if any(p not in {'alt','ctrl','shift','meta'} for p in parts[:-1]): raise ValueError('Unknown key modifier')
+    if 'meta' in parts[:-1]: modifiers |= 4
 
     # Map common key names to CDP key codes
     key_map = {
@@ -691,19 +705,29 @@ def _cdp_key(combo: str) -> str:
 
     if key in key_map:
         key_val, code, vk = key_map[key]
-    elif len(key) == 1:
-        key_val, code, vk = key, f"Key{key.upper()}", ord(key.upper())
+    elif len(key) == 1 and key.isascii() and key.isalnum():
+        key_val, code, vk = key.upper() if modifiers & 8 else key, f"{'Digit' if key.isdigit() else 'Key'}{key.upper()}", ord(key.upper())
     else:
-        key_val, code, vk = key, key, 0
+        raise ValueError('Unsupported key name')
 
     ws = _cdp_ws()
-    for evt in ["keyDown", "keyUp"]:
-        ws.send(json.dumps({"id": 1, "method": "Input.dispatchKeyEvent", "params": {
+    for index, evt in enumerate(["keyDown", "keyUp"], 1):
+        params = {
             "type": evt, "key": key_val, "code": code,
             "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
             "modifiers": modifiers
-        }}))
-        ws.recv()
+        }
+        if evt == 'keyDown' and not modifiers:
+            if key == 'enter': params.update(text='\r', unmodifiedText='\r')
+            elif key == 'space': params.update(text=' ', unmodifiedText=' ')
+            elif len(key) == 1: params.update(text=key, unmodifiedText=key)
+        ws.send(json.dumps({"id": index, "method": "Input.dispatchKeyEvent", "params": params}))
+        while True:
+            response=json.loads(ws.recv())
+            if response.get('id') == index: break
+        if response.get('error'):
+            ws.close()
+            raise RuntimeError('CDP key event rejected')
     ws.close()
     return "ok"
 
@@ -735,36 +759,31 @@ def _cdp_navigate(url: str) -> str:
 
 
 def _inject_action(action: str, text: str = "", target: str = "", app: Optional[str] = None, wait: bool = True) -> int:
-    """Insert an action into the inject table and optionally wait for completion.
-
-    DirectShell polls the inject table, executes the action, then sets done=1.
-    If wait=True, this function blocks until the action is confirmed done,
-    ensuring subsequent ds_state() calls return the post-action screen.
-    """
+    """Queue a semantic native action only on the selected, current DS backend."""
+    active = _read_active()
+    if not active['snapped'] or (app and app != active['app']):
+        raise RuntimeError('TARGET_NOT_SELECTED: use ds_focus to select this application in DS first.')
     db_path = _get_db_path(app)
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA journal_mode=WAL;")
-    try:
-        cur = conn.execute(
-            "INSERT INTO inject (action, text, target, done) VALUES (?, ?, ?, 0)",
-            (action, text, target),
-        )
-        conn.commit()
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        try:
+            ready = conn.execute("SELECT 1 FROM capabilities WHERE name='semantic_native_v1'").fetchone()
+        except sqlite3.OperationalError:
+            ready = None
+        if not ready:
+            raise RuntimeError('NATIVE_BACKEND_OUTDATED: no semantic native backend; global input is not a fallback.')
+        cur = conn.execute('INSERT INTO inject(action,text,target,done,expires_at) VALUES(?,?,?,0,?)',
+                           (action,text,target,int(time.time()*1000)+4000))
         action_id = cur.lastrowid
-    finally:
-        conn.close()
-
     if wait:
-        _wait_for_action(action_id, db_path)
-
+        _wait_for_action(action_id,db_path)
     return action_id
 
 
-def _wait_for_action(action_id: int, db_path: Path, timeout: float = 5.0, poll_interval: float = 0.05):
+def _wait_for_action(action_id: int, db_path: Path, timeout: float = 25.0, poll_interval: float = 0.05):
     """Poll the inject table until the action is marked done=1.
 
     Polls every 50ms (fast enough to feel instant, light enough to not spam).
-    Times out after 5 seconds to prevent infinite hangs.
+    Isolated provider execution is bounded; fresh perception has its own bound.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -772,18 +791,29 @@ def _wait_for_action(action_id: int, db_path: Path, timeout: float = 5.0, poll_i
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             try:
                 row = conn.execute(
-                    "SELECT done FROM inject WHERE id=?", (action_id,)
+                    "SELECT done,outcome FROM inject WHERE id=?", (action_id,)
                 ).fetchone()
+                if row and row[0] == 2:
+                    raise RuntimeError('Native action: ' + (row[1] or 'failed or cancelled; execution unconfirmed'))
                 if row and row[0] == 1:
-                    # Action done — wait one more cycle for DS to write output files
-                    time.sleep(0.15)
+                    # Provider acknowledgement and published perception are two
+                    # different events. Never hand back the pre-action tree.
+                    acknowledged=time.time()
+                    ready=_await_native_snapshot(db_path.stem,acknowledged,timeout=10.0)
+                    if not ready.get('snapshot_ready'):
+                        raise RuntimeError('Native action acknowledged ('+str(row[1])+'), but fresh view is pending. Do not repeat the mutation; refresh the view.')
                     return
             finally:
                 conn.close()
         except sqlite3.OperationalError:
             pass  # DB locked, retry
         time.sleep(poll_interval)
-    # Timeout — return anyway, action might still execute
+    with closing(sqlite3.connect(db_path)) as connection, connection:
+        connection.execute("UPDATE inject SET done=2,outcome='CANCELLED_BEFORE_EXECUTION' WHERE id=? AND done=0", (action_id,))
+    raise TimeoutError(
+        f"DirectShell action {action_id} was not confirmed within {timeout:.1f}s; "
+        "pending action cancelled; an already-running provider call remains unconfirmed. Do not blindly repeat"
+    )
 
 
 def _with_chars(text: str) -> str:
@@ -868,8 +898,29 @@ def ds_apps(prev_ok: str) -> str:
     status = _read_active()
     focused = status["app"] if status["snapped"] else "none"
     apps = sorted(set(w["app"] for w in data.get("windows", [])))
-    result = f"Focused: {focused}\nApps: {', '.join(apps)}"
+    result = f"Agent target (not Windows focus): {focused}\nApps: {', '.join(apps)}"
+    result += '\n'+'\n'.join(f"{w['app']} | {w.get('exe','')} | {w.get('title','')}" for w in data.get('windows',[])[:100])
+    result += '\nATTIA approval and Windows security surfaces are excluded from automation.'
     return _with_chars(result)
+
+
+def _await_native_snapshot(app: str, started: float, timeout: float = 10.0) -> dict:
+    """A selected window is ready only after its own fresh semantic snapshot exists."""
+    deadline = time.monotonic() + timeout
+    snapshot = PROFILES_DIR / (app + '.a11y.snap')
+    while time.monotonic() < deadline:
+        active = _read_active()
+        try:
+            if active['snapped'] and active['app'] == app and snapshot.stat().st_mtime >= started:
+                with closing(sqlite3.connect(f'file:{PROFILES_DIR / (app+".db")}?mode=ro',uri=True)) as db:
+                    captured=db.execute("SELECT value FROM meta WHERE key='timestamp'").fetchone()
+                if captured and float(captured[0])/1000>=started and snapshot.stat().st_mtime>=float(captured[0])/1000:
+                    return {'status':'ok', 'app':app, 'snapshot_ready':True}
+        except (OSError,sqlite3.Error,ValueError):
+            pass
+        time.sleep(.05)
+    return {'status':'pending', 'app':app, 'snapshot_ready':False,
+            'reason':'Window selected; accessibility provider has not produced a fresh snapshot yet. Repeat ds_focus to wait for readiness; do not repeat a mutation.'}
 
 
 @mcp.tool()
@@ -885,14 +936,14 @@ def ds_focus(app: str, prev_ok: str) -> dict:
     """
     _require_ds()
     try:
-        _tip_engine.update_context("ds_focus", {"app": app}, "", prev_ok)
+        if not _EXTERNAL_LEARNING:
+            _tip_engine.update_context("ds_focus", {"app": app}, "", prev_ok)
     except Exception:
         pass
-    # Invalidate cached tools from previous app — prevents stale ds_act() calls
-    global _active_view, _cdp_labels, _cdp_tool_map
-    _active_view = {"screen": "", "tools": [], "data": "", "raw_tools": []}
-    _cdp_labels = set()
-    _cdp_tool_map = {}
+    global _native_selected_hwnd
+    if app.strip().lower() in {'attia','attia.exe'}:
+        _clear_view()
+        return {'status':'error','reason':'PROTECTED_SURFACE: ATTIA approvals cannot be automated. Use another application from ds_apps.'}
 
     # Clean up any old result
     result_file = PROFILES_DIR / "snap_result"
@@ -901,6 +952,7 @@ def ds_focus(app: str, prev_ok: str) -> dict:
 
     # Write snap request
     req_file = PROFILES_DIR / "snap_request"
+    started = time.time()
     req_file.write_text(app.strip(), encoding="utf-8")
 
     # Wait for result (DS polls every 200ms, snap takes ~500ms)
@@ -910,6 +962,12 @@ def ds_focus(app: str, prev_ok: str) -> dict:
             try:
                 result = json.loads(result_file.read_text(encoding="utf-8"))
                 result_file.unlink()
+                if result.get('status') == 'ok':
+                    hwnd=result.get('hwnd')
+                    if hwnd!=_native_selected_hwnd:_clear_view()
+                    _native_selected_hwnd=hwnd
+                    result = _await_native_snapshot(result['app'], started)
+                else:_clear_view()
                 tips = _tip_engine.get_tips_block("ds_focus")
                 if tips:
                     result["tips"] = tips
@@ -917,14 +975,8 @@ def ds_focus(app: str, prev_ok: str) -> dict:
             except (json.JSONDecodeError, OSError):
                 continue
 
-    # Timeout — check if is_active changed
-    status = _read_active()
-    if status["snapped"] and status["app"] == app.strip().lower():
-        result = {"status": "ok", "app": app}
-        tips = _tip_engine.get_tips_block("ds_focus")
-        if tips:
-            result["tips"] = tips
-        return result
+    # Old is_active state does not acknowledge this request.
+    _clear_view()
     return {"status": "timeout", "reason": f"DirectShell did not snap to '{app}' within 3 seconds."}
 
 
@@ -1018,12 +1070,8 @@ def ds_tab(identifier: str, prev_ok: str) -> str:
     if not target:
         return f"No tab matching '{identifier}'. Use ds_tabs() to see available tabs."
 
-    # Activate via CDP
-    import websocket as _ws
-    ws = _ws.create_connection(target["webSocketDebuggerUrl"], timeout=5)
-    ws.send(json.dumps({"id": 1, "method": "Page.bringToFront", "params": {}}))
-    ws.recv()
-    ws.close()
+    # Select only our protocol target, never the user's foreground window.
+    if _cdp_active_tab_id!=target['id']:_clear_view()
     _cdp_active_tab_id = target["id"]
     r = f"Switched to: {target.get('title', '?')}"
     _log_action("ds_tab", {"identifier": identifier}, r, prev_ok)
@@ -1044,11 +1092,17 @@ def ds_navigate(url: str, prev_ok: str) -> str:
     _require_ds()
     if not _is_cdp_available():
         return "CDP not available."
+    _clear_view()
     ws = _cdp_ws()
+    _clear_view()
     ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": url}}))
-    result = json.loads(ws.recv())
-    ws.close()
-    frame_id = result.get("result", {}).get("frameId", "")
+    try:
+        result = _cdp_response(ws, 1)
+        if result.get('result',{}).get('errorText'):
+            raise RuntimeError('Navigation failed: '+result['result']['errorText'])
+    finally:
+        ws.close()
+    frame_id = result.get("result",{}).get("frameId", "")
     r = f"Navigated to {url}" if frame_id else f"Navigation sent to {url}"
     _log_action("ds_navigate", {"url": url}, r, prev_ok)
     return r + _tip_engine.get_tips_block("ds_navigate")
@@ -1116,7 +1170,7 @@ def ds_mobile(prev_ok: str, enabled: bool = True) -> str:
             tw = None
             try:
                 import websocket as _ws_mod
-                tw = _ws_mod.create_connection(tab["webSocketDebuggerUrl"], timeout=3)
+                tw = _ws_mod.create_connection(tab["webSocketDebuggerUrl"], timeout=3, suppress_origin=os.environ.get('ATTIA_DS_MODE') == '1')
                 _tab_id = 0
                 def _tab_send(method: str, params: dict = None):
                     nonlocal _tab_id
@@ -1217,7 +1271,7 @@ def ds_state(prev_ok: str, app: Optional[str] = None) -> str:
         app: Optional app name. If omitted, uses the currently snapped app.
     """
     _require_ds()
-    return _with_chars(_read_file(".a11y.snap", app))
+    return _with_chars(_bounded_native(_read_file(".a11y.snap", app)))
 
 
 @mcp.tool()
@@ -1247,8 +1301,8 @@ def ds_screen(prev_ok: str, app: Optional[str] = None) -> str:
             r = _with_chars(text.strip()) if text else "(empty page)"
             return r + _tip_engine.get_tips_block("ds_screen")
         except Exception:
-            pass
-    r = _with_chars(_read_file(".a11y", app))
+            if os.environ.get('ATTIA_DS_MODE') == '1': raise
+    r = _with_chars(_bounded_native(_read_file(".a11y", app)))
     return r + _tip_engine.get_tips_block("ds_screen")
 
 
@@ -1294,7 +1348,7 @@ def ds_elements(prev_ok: str, app: Optional[str] = None) -> str:
         app: Optional app name. If omitted, uses the currently snapped app.
     """
     _require_ds()
-    return _with_chars(_read_file(".snap", app))
+    return _with_chars(_bounded_native(_read_file(".snap", app)))
 
 
 @mcp.tool()
@@ -1529,6 +1583,7 @@ def ds_click(element_name: str, prev_ok: str, app: Optional[str] = None) -> str:
             r = f"ok cdp{_learning_hint()}"
         except Exception:
             # CDP can't find it (e.g. cross-origin iframe) — fall back to UIA
+            if os.environ.get('ATTIA_DS_MODE') == '1': raise
             action_id = _inject_action("click", target=element_name, app=app)
             r = f"ok uia-fallback #{action_id}{_learning_hint()}"
     else:
@@ -1542,9 +1597,8 @@ def ds_click(element_name: str, prev_ok: str, app: Optional[str] = None) -> str:
 def ds_text(value: str, target: str, prev_ok: str, app: Optional[str] = None) -> str:
     """Set text in a named input field. PREFERRED over ds_type — instant and reliable.
 
-    First focuses the target field, then types the text via simulated keyboard events.
-    In browser mode: uses CDP Input.dispatchKeyEvent (real keyboard simulation).
-    In native mode: uses UIA ValuePattern (instant set, no character-by-character typing).
+    Browser mode uses the managed DOM target. Native mode uses writable
+    ValuePattern with readback. Neither route changes Windows keyboard focus.
 
     Args:
         value: The text to insert (e.g., "Hello world").
@@ -1565,20 +1619,19 @@ def ds_text(value: str, target: str, prev_ok: str, app: Optional[str] = None) ->
 
 @mcp.tool()
 def ds_type(text: str, prev_ok: str, app: Optional[str] = None) -> str:
-    """Type text into the currently focused element. Use ds_text() instead when possible.
+    """Append text to the agent-selected native field or managed browser input.
 
-    Only use ds_type when ds_text doesn't work (Discord chat, terminals, canvas apps).
-    Types into whatever currently has keyboard focus — no target parameter.
-    Use \\t for Tab, \\n for Enter within the text.
+    Native target was selected by ds_click or ds_text; never uses the user's
+    keyboard focus. Not a fallback for unsupported ValuePattern. Text is literal.
 
     Args:
-        text: The text to type (e.g., "hello\\n" to type hello and press Enter).
+        text: Text to append; a newline is text, not a submit-key request.
         app: Optional app name (UIA mode only).
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
     _require_ds()
     _log_action("ds_type", {"text": text}, "", prev_ok)
-    text = text.replace("\\t", "\t").replace("\\n", "\n").replace("\\r", "\r")
+    # JSON has already decoded control characters; preserve literal Windows paths.
     if _is_cdp_available():
         _cdp_type(text)
         return f"ok cdp{_learning_hint()}"
@@ -1588,10 +1641,10 @@ def ds_type(text: str, prev_ok: str, app: Optional[str] = None) -> str:
 
 @mcp.tool()
 def ds_key(combo: str, prev_ok: str, app: Optional[str] = None) -> str:
-    """Press a keyboard shortcut. Works in both browser (CDP) and native (UIA) mode.
+    """Run a target-scoped shortcut, never a global Windows key.
 
-    Common combos: "enter", "tab", "escape", "pagedown", "pageup",
-    "ctrl+a", "ctrl+c", "ctrl+v", "ctrl+s", "alt+arrowleft" (back), "f5" (refresh).
+    Native: logical ctrl+a, selected-text deletion, semantic Enter/expansion
+    where supported. Unsupported combinations fail explicitly. Browser uses CDP.
 
     Args:
         combo: Key combination (e.g., "ctrl+shift+s"). Modifiers: ctrl, alt, shift.
@@ -1610,28 +1663,31 @@ def ds_key(combo: str, prev_ok: str, app: Optional[str] = None) -> str:
 
 
 @mcp.tool()
-def ds_scroll(direction: str, prev_ok: str, amount: int = 1, app: Optional[str] = None) -> str:
+def ds_scroll(direction: str, prev_ok: str, amount: int = 1, app: Optional[str] = None, target: Optional[str] = None) -> str:
     """Scroll the page. Works in both browser (CDP) and native (UIA) mode.
 
-    Each notch scrolls ~3 lines. Use ds_update_view() after scrolling to see new content.
+    Native ScrollItem/ScrollPattern with readback; browser scroll is DOM-scoped.
+    Use ds_update_view() after scrolling to see new content.
 
     Args:
         direction: "up", "down", "left", or "right".
-        amount: Number of scroll notches (default 1, use 3-5 for a full page).
+        amount: 1-20 provider-dependent steps (default 1), not a fixed pixel distance.
+        target: Native scroll container or child name; required if multiple containers are available.
         app: Optional app name (UIA mode only).
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
     _require_ds()
     if direction not in ("up", "down", "left", "right"):
         raise ValueError(f"Invalid direction: {direction}. Use up/down/left/right.")
+    if not isinstance(amount,int) or isinstance(amount,bool) or not 1<=amount<=20:
+        raise ValueError('Scroll amount must be an integer from 1 to 20.')
     if _is_cdp_available():
         _cdp_scroll(direction, amount)
         r = f"ok cdp{_learning_hint()}"
     else:
         ids = []
         for i in range(amount):
-            is_last = (i == amount - 1)
-            ids.append(_inject_action("scroll", text=direction, app=app, wait=is_last))
+            ids.append(_inject_action("scroll", text=direction, target=target or '', app=app, wait=True))
         r = f"ok #{ids[-1]}"
     _log_action("ds_scroll", {"direction": direction, "amount": amount}, r, prev_ok)
     return r
@@ -1782,6 +1838,18 @@ def ds_profile_get(app: str, prev_ok: str) -> dict:
 
 # In-memory store for active tools
 _active_view = {"screen": "", "tools": [], "data": "", "raw_tools": []}
+_native_selected_hwnd=None
+
+def _clear_view():
+    global _active_view,_cdp_labels,_cdp_tool_map
+    _active_view={"screen":"","tools":[],"data":"","raw_tools":[]}
+    _cdp_labels=set();_cdp_tool_map={}
+
+def _view_owner():
+    return ('cdp',_cdp_active_tab_id) if _is_cdp_available() else ('uia',_get_snapped_app(),_native_selected_hwnd)
+
+def _bounded_native(text):
+    return text if len(text)<=8000 else text[:8000]+f'\n[Truncated: {len(text)-8000} characters omitted. Use ds_find with a specific name, or scroll and refresh.]'
 _cdp_labels: set = set()  # CDP element labels from last update_view
 
 
@@ -1808,6 +1876,8 @@ def _cdp_extract() -> dict:
         function labelFor(el) {
             const raw =
                 el.getAttribute?.('aria-label') ||
+                (['submit','button','reset','image'].includes(el.type) ? (el.value || el.alt || el.title) : '') ||
+                (el.labels && Array.from(el.labels).map(l => l.textContent.trim()).join(' ')) ||
                 el.placeholder ||
                 (el.textContent || '').trim() ||
                 el.name ||
@@ -1834,6 +1904,7 @@ def _cdp_extract() -> dict:
             const tag = (el.tagName || '').toLowerCase();
             const role = (el.getAttribute && el.getAttribute('role')) || '';
             if (tag === 'select') return 'click'; // treat as click (select handling is app-specific)
+            if (tag === 'input' && ['submit','button','reset','image','checkbox','radio','file'].includes(el.type)) return 'click';
             if (['input', 'textarea'].includes(tag)) return 'type';
             if (['textbox', 'searchbox', 'combobox'].includes(role)) return 'type';
             if (el.isContentEditable) return 'type';
@@ -2018,10 +2089,12 @@ def ds_update_view(prev_ok: str, app: Optional[str] = None) -> str:
         try:
             cdp = _cdp_extract()
         except Exception:
+            if os.environ.get('ATTIA_DS_MODE') == '1':
+                raise
             cdp = None
 
-    if cdp and cdp["tools"]:
-        _active_view = {"screen": cdp["text"], "tools": cdp["tools"], "data": ""}
+    if cdp is not None and (cdp['tools'] or os.environ.get('ATTIA_DS_MODE') == '1'):
+        _active_view = {"screen": cdp["text"], "tools": cdp["tools"], "data": "", "owner":_view_owner()}
         _cdp_labels = {t["element"] for t in cdp["tools"]}
         _cdp_tool_map = {t["element"]: t for t in cdp["tools"] if isinstance(t, dict) and t.get("element")}
 
@@ -2048,13 +2121,15 @@ def ds_update_view(prev_ok: str, app: Optional[str] = None) -> str:
             action = "type" if "[keyboard]" in line else "click"
             tools.append({"action": action, "element": name, "description": ""})
 
-    _active_view = {"screen": a11y, "tools": tools, "data": ""}
+    omitted_tools=max(0,len(tools)-100)
+    tools=tools[:100]
+    _active_view = {"screen": a11y, "tools": tools, "data": "", "app":app or _get_snapped_app(),"owner":_view_owner()}
     _cdp_labels = set()
     _cdp_tool_map = {}
 
     tool_lines = []
     for i, t in enumerate(tools, 1):
-        tool_lines.append(f"[{i}] {t['action']}|{t['element']}")
+        tool_lines.append(f"[{i}] {t['action']}|{_clean(t['element'],240)}")
 
     # Extract text content from a11y
     content = ""
@@ -2068,7 +2143,10 @@ def ds_update_view(prev_ok: str, app: Optional[str] = None) -> str:
         if in_content and line.strip():
             content += line.strip() + "\n"
 
-    result = (content.strip() or "(no text)") + "\n---\n" + "\n".join(tool_lines)
+    omitted_text=max(0,len(content.strip())-8000)
+    result = (content.strip()[:8000] or "(no text)") + "\n---\n" + "\n".join(tool_lines)
+    if omitted_tools or omitted_text:
+        result+=f'\n[Bounded view: {omitted_text} text characters and {omitted_tools} tools omitted. Use ds_find for a specific element, or ds_scroll then refresh.]'
     result += _tip_engine.get_tips_block("ds_update_view")
     return _with_chars(result)
 
@@ -2128,6 +2206,8 @@ def ds_act(tool_number: int, prev_ok: str, text: Optional[str] = None, app: Opti
     _require_ds()
     if not _active_view["tools"]:
         raise ValueError("No active tools. Call ds_update_view() first.")
+    if _active_view.get('owner')!=_view_owner():
+        raise ValueError('Tool list belongs to another target. Call ds_update_view() for the selected app/tab first.')
 
     idx = tool_number - 1
     if idx < 0 or idx >= len(_active_view["tools"]):
