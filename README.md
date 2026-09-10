@@ -313,6 +313,8 @@ DirectShell does not bypass access controls. It does not inject code into other 
 - [`BRAINSTORM.md`](BRAINSTORM.md) — Original vision and design decisions
 - [`Dokumentation/ARCHITECTURE.md`](Dokumentation/ARCHITECTURE.md) — Technical reference (code-level)
 - [`Dokumentation/PAPER.md`](Dokumentation/PAPER.md) — Academic whitepaper
+- [`ds-mcp/GUIDE.md`](ds-mcp/GUIDE.md) — MCP server setup and tool reference
+- [`LLM_GUIDE.md`](LLM_GUIDE.md) — LLM quick-start guide (context for AI sessions)
 
 ### Dev Blog
 

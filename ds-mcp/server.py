@@ -80,6 +80,22 @@ def get_profiles_dir() -> Path:
 PROFILES_DIR = get_profiles_dir()
 PROFILES_JSON = PROFILES_DIR / "app_profiles.json"
 
+# ── Startup consistency check ──────────────────────────────────────────
+# Verify that PROFILES_DIR is the same directory the Rust daemon writes to.
+# The daemon creates is_active and windows.json on startup — if they're
+# missing, the MCP server is likely pointing at the wrong ds_profiles.
+_active = PROFILES_DIR / "is_active"
+_windows = PROFILES_DIR / "windows.json"
+if not _active.exists() or not _windows.exists():
+    import logging as _log
+    _log.warning(
+        "ds_profiles consistency check: %s does not contain is_active or "
+        "windows.json. The MCP server may be pointing at a different "
+        "ds_profiles directory than the running DirectShell daemon. "
+        "Use --profiles or DS_PROFILES to point at the correct path.",
+        PROFILES_DIR,
+    )
+
 # Initialize tip engine with tips directory
 _tip_engine.init(Path(__file__).resolve().parent / "tips")
 

@@ -19,6 +19,7 @@ mod snapshot_store;
 use std::ffi::c_void;
 use std::fs;
 use std::mem;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering::SeqCst};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -2402,6 +2403,18 @@ fn main() -> Result<()> {
 
         // Daemon Mode: Background window enumeration + snap request polling
         let _ = fs::create_dir_all(DB_DIR);
+
+        // Write breadcrumb so MCP server can find the same ds_profiles directory.
+        // MCP checks %LOCALAPPDATA%\DirectShell\profiles_path.txt on startup.
+        if let Ok(abs) = std::env::current_dir() {
+            let profiles_abs = abs.join(DB_DIR);
+            if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
+                let dir = PathBuf::from(&local_app).join("DirectShell");
+                let _ = fs::create_dir_all(&dir);
+                let _ = fs::write(dir.join("profiles_path.txt"), profiles_abs.to_string_lossy().as_bytes());
+            }
+        }
+
         let _ = SetTimer(hwnd, ENUM_TIMER, ENUM_MS, None);
         let _ = SetTimer(hwnd, SNAP_REQ_TIMER, SNAP_REQ_MS, None);
         log("Daemon mode: ENUM_TIMER + SNAP_REQ_TIMER started");
