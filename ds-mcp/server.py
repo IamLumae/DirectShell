@@ -758,7 +758,7 @@ def _cdp_navigate(url: str) -> str:
     return "ok"
 
 
-def _inject_action(action: str, text: str = "", target: str = "", app: Optional[str] = None, wait: bool = True) -> int:
+def _inject_action(action: str, text: str = "", target: str = "", app: Optional[str] = None, wait: bool = True, deadline: Optional[float] = None) -> int:
     """Queue a semantic native action only on the selected, current DS backend."""
     active = _read_active()
     if not active['snapped'] or (app and app != active['app']):
@@ -775,11 +775,14 @@ def _inject_action(action: str, text: str = "", target: str = "", app: Optional[
                            (action,text,target,int(time.time()*1000)+4000))
         action_id = cur.lastrowid
     if wait:
-        _wait_for_action(action_id,db_path)
+        if deadline is None:
+            _wait_for_action(action_id,db_path)
+        else:
+            _wait_for_action(action_id,db_path,timeout=max(0,deadline-time.monotonic()),absolute_deadline=deadline)
     return action_id
 
 
-def _wait_for_action(action_id: int, db_path: Path, timeout: float = 25.0, poll_interval: float = 0.05):
+def _wait_for_action(action_id: int, db_path: Path, timeout: float = 25.0, poll_interval: float = 0.05, absolute_deadline: Optional[float] = None):
     """Poll the inject table until the action is marked done=1.
 
     Polls every 50ms (fast enough to feel instant, light enough to not spam).
@@ -799,7 +802,8 @@ def _wait_for_action(action_id: int, db_path: Path, timeout: float = 25.0, poll_
                     # Provider acknowledgement and published perception are two
                     # different events. Never hand back the pre-action tree.
                     acknowledged=time.time()
-                    ready=_await_native_snapshot(db_path.stem,acknowledged,timeout=10.0)
+                    view_timeout=10.0 if absolute_deadline is None else min(10.0,max(0,absolute_deadline-time.monotonic()))
+                    ready=_await_native_snapshot(db_path.stem,acknowledged,timeout=view_timeout)
                     if not ready.get('snapshot_ready'):
                         raise RuntimeError('Native action acknowledged ('+str(row[1])+'), but fresh view is pending. Do not repeat the mutation; refresh the view.')
                     return
@@ -1366,15 +1370,46 @@ def ds_query(sql: str, prev_ok: str, app: Optional[str] = None) -> list[dict]:
     NOTE: Only works for native apps (UIA). Not available in browser/CDP mode.
 
     Args:
-        sql: A SELECT query. Write queries are not allowed.
+        sql: One SELECT against elements only. Max 200 rows / 32 KiB;
+            use WHERE, selected columns and LIMIT. Oversize/time-budget results
+            fail explicitly, never return an unmarked partial result.
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
         app: Optional app name. If omitted, uses the currently snapped app.
     """
     _require_ds()
-    sql_lower = sql.strip().lower()
-    if not sql_lower.startswith("select"):
-        raise ValueError("Only SELECT queries are allowed. Use action tools to modify state.")
-    return _db_query(sql, app)
+    if _is_cdp_available():
+        raise ValueError('ds_query is native-only; select a native app with ds_focus or app first.')
+    if not isinstance(sql,str) or not sql.strip().lower().startswith('select') or len(sql.encode())>8192:
+        raise ValueError('Use one SELECT of at most 8 KiB against elements.')
+    db_path=_get_db_path(app).resolve()
+    if db_path.parent!=PROFILES_DIR.resolve():
+        raise ValueError('Invalid native profile path.')
+    functions={'count','min','max','sum','avg','total','length','lower','upper','substr','substring','trim','ltrim','rtrim','coalesce','ifnull','nullif','round','abs','like','glob'}
+    def authorize(action,first,second,database,source):
+        if action==sqlite3.SQLITE_SELECT:return sqlite3.SQLITE_OK
+        # SQLite reports database=None for count(*)'s table-level read.
+        if action==sqlite3.SQLITE_READ and first=='elements' and (database=='main' or (database is None and second=='')):return sqlite3.SQLITE_OK
+        if action==sqlite3.SQLITE_FUNCTION and second in functions:return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+    with closing(sqlite3.connect(db_path.as_uri()+'?mode=ro',uri=True,timeout=.2)) as conn:
+        conn.row_factory=sqlite3.Row
+        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH,32768)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH,8192)
+        conn.set_authorizer(authorize)
+        deadline=time.monotonic()+.25
+        conn.set_progress_handler(lambda:int(time.monotonic()>deadline),1000)
+        try:
+            cursor=conn.execute(sql)
+            result=[];size=2
+            for row in cursor:
+                item=dict(row)
+                size+=len(json.dumps(item,ensure_ascii=False).encode())+2
+                if len(result)>=200 or size>32768:
+                    raise ValueError('Query result exceeds 200 rows / 32 KiB. Narrow WHERE/columns/LIMIT; no partial result returned.')
+                result.append(item)
+            return result
+        except sqlite3.Error as error:
+            raise ValueError('Read-only elements query rejected, invalid or over its resource budget: '+str(error)) from error
 
 
 @mcp.tool()
@@ -1693,12 +1728,35 @@ def ds_scroll(direction: str, prev_ok: str, amount: int = 1, app: Optional[str] 
     return r
 
 
+def _validate_batch(actions: list[dict]) -> None:
+    """Reject the whole batch before any mutation if any step is malformed."""
+    if not isinstance(actions,list) or not 1<=len(actions)<=16:
+        raise ValueError('Batch requires 1–16 actions.')
+    for index,act in enumerate(actions):
+        if not isinstance(act,dict) or set(act)-{'action','target','text'} or act.get('action') not in {'click','text','type','key'}:
+            raise ValueError(f'Invalid batch step {index+1}: use action click/text/type/key, target and text only.')
+        if any(not isinstance(value,str) or '\0' in value for value in act.values()):
+            raise ValueError(f'Invalid batch step {index+1}: fields must be text without NUL.')
+        if act['action'] in {'click','text'} and not act.get('target','').strip():
+            raise ValueError(f'Batch step {index+1} requires a named target.')
+        if act['action']!='click' and 'text' not in act:
+            raise ValueError(f'Batch step {index+1} requires text (key uses text for its combo).')
+        if act['action']=='key' and not act['text'].strip():
+            raise ValueError('Batch key combo cannot be empty.')
+    if len(json.dumps(actions,ensure_ascii=False).encode())>22000:
+        raise ValueError('Batch arguments exceed 22 KiB.')
+
+
 @mcp.tool()
 def ds_batch(actions: list[dict], prev_ok: str, app: Optional[str] = None) -> str:
     """Execute multiple actions in sequence. Works in both browser (CDP) and native (UIA) mode.
 
     Use this to chain clicks, text input, and key presses without round-trips.
 
+    1–16 actions, validated before execution; stops on the first failure.
+    Every native step waits for acknowledgement and fresh perception.
+    A failure reports confirmed progress; the failed step may have applied.
+    Never blindly replay a partially completed batch. Execution budget: 20 s.
     Each action dict needs: "action" (click/text/key), plus "target" and/or "text".
     Example: [{"action": "click", "target": "Email"}, {"action": "text", "text": "hi@test.com", "target": "Email"}, {"action": "key", "text": "tab"}]
 
@@ -1707,30 +1765,23 @@ def ds_batch(actions: list[dict], prev_ok: str, app: Optional[str] = None) -> st
         app: Optional app name (UIA mode only).
         prev_ok: Was your LAST MCP call successful? MUST answer: "yes", "no", or "unknown".
     """
+    _validate_batch(actions)
     _require_ds()
-    if _is_cdp_available():
-        for act in actions:
-            a = act.get("action", "click")
-            if a == "click":
-                _cdp_click(act.get("target", ""))
-            elif a in ("type", "text"):
-                _cdp_type(act.get("text", ""), act.get("target", ""))
-            elif a == "key":
-                _cdp_key(act.get("text", ""))
-        r = f"ok {len(actions)} actions cdp{_learning_hint()}"
-    else:
-        total = len(actions)
-        last_id = 0
-        for i, act in enumerate(actions):
-            is_last = (i == total - 1)
-            last_id = _inject_action(
-                action=act.get("action", "text"),
-                text=act.get("text", ""),
-                target=act.get("target", ""),
-                app=app,
-                wait=is_last,
-            )
-        r = f"ok {total} actions, last #{last_id}{_learning_hint()}"
+    browser=_is_cdp_available()
+    deadline=time.monotonic()+20
+    for index,act in enumerate(actions):
+        try:
+            if time.monotonic()>=deadline:raise TimeoutError('Batch budget exhausted before dispatch')
+            action=act['action']
+            if browser:
+                if action=='click':_cdp_click(act['target'])
+                elif action in {'text','type'}:_cdp_type(act['text'],act.get('target',''))
+                else:_cdp_key(act['text'])
+            else:
+                _inject_action(action=action,text=act.get('text',''),target=act.get('target',''),app=app,wait=True,deadline=deadline)
+        except Exception as error:
+            raise RuntimeError(f'Batch stopped: {index}/{len(actions)} confirmed; step {index+1} failed or unconfirmed. Later steps were not dispatched. Do not replay; read state first. Cause: {error}') from error
+    r=f'ok {len(actions)}/{len(actions)} actions confirmed ({"cdp" if browser else "native"})'
     _log_action("ds_batch", {"actions": actions}, r, prev_ok)
     return r
 

@@ -36,6 +36,10 @@ After reconnect/helper restart, select and read again.
 - `ds_find(name_pattern="%part of name%")`: native visible enabled matches;
   SQL LIKE `%` is the wildcard. Search narrowly instead of requesting a full chat.
 - `ds_events`: compact change events. `ds_print`: full managed-browser page text.
+- `ds_query(sql="SELECT name, value FROM elements WHERE role='Edit' LIMIT 20")`:
+  native-only, read-only element SQL. Maximum200 rows/32 KiB,250ms SQL budget;
+  overflow is an explicit error, not an unmarked partial result. Select narrow
+  columns/WHERE/LIMIT. No access to queues, other tables or other files.
 
 ## Actions
 
@@ -61,10 +65,21 @@ After reconnect/helper restart, select and read again.
 
 ## Learning and lifecycle
 
+`ds_batch(actions=[{"action":"text","target":"Search","text":"example"},
+{"action":"key","text":"enter"}])` runs1–16 validated actions in order.
+Supported actions: click/text/type/key; `text` replaces a named input, `type`
+appends to the agent-selected input. Native steps wait for acknowledgement and
+fresh perception. After20s no further step starts. The first failure stops the
+batch and reports confirmed progress; the failed step may already have applied.
+Never replay the batch blindly. Read state and continue only the remaining work.
+One batch is one approved request, not permission for arbitrary later actions.
+
 `ds_learn(app, context, append)` stores concise reusable tips, not user documents,
 credentials or chat dumps. `ds_profile_list/save/get` stores semantic mappings.
 Learning failure never changes whether an action succeeded; do not repeat an
 action to repair logging. ATTIA scopes stores per authenticated connection.
 PC-tool revocation, logout or app exit closes the helper and managed browser.
-The ATTIA pilot exposes only its catalog; standalone-only `ds_query`, `ds_batch`
-and overlay controls are not available. No admin/UAC or CAPTCHA bypass.
+The ATTIA pilot exposes only its catalog, including `ds_query` and `ds_batch`.
+Overlay controls are not available. No admin/UAC or CAPTCHA bypass.
+Claude ToolSearch discovers MCP schemas on demand; search by task/tool name
+before use instead of loading the complete catalog into every turn.
